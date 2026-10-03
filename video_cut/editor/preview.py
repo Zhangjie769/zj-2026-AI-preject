@@ -49,9 +49,16 @@ class AudioEngine:
         self._wav = None
         self._sf = None
         self._vol = 1.0
+        self._cache = {}      # (src,in,out,spd,vol) -> wav 路径（同参数不重解）
 
     def prepare(self, src: str, in_pt: float, out_len: float,
                 speed: float, volume: float) -> str | None:
+        key = (src, round(in_pt, 3), round(out_len, 3),
+               round(speed, 3), round(volume, 3))
+        cached = self._cache.get(key)
+        if cached and os.path.isfile(cached):
+            return cached
+        out_len = min(out_len, 1200.0)   # 预览音频最长准备 20 分钟
         try:
             fd, wav = tempfile.mkstemp(suffix=".wav", prefix="vcp_aud_")
             os.close(fd)
@@ -76,6 +83,9 @@ class AudioEngine:
             if os.path.getsize(wav) < 1024:
                 os.remove(wav)
                 return None
+            if len(self._cache) >= 3:
+                self._cache.pop(next(iter(self._cache)))
+            self._cache[key] = wav
             return wav
         except Exception as e:
             log.error("音频解码失败 %s: %s", src, e)
@@ -636,6 +646,14 @@ class PreviewPlayer:
         except Exception:
             pass
         return 30.0
+
+    def clear_cache(self):
+        for w in self._cache.values():
+            try:
+                os.remove(w)
+            except Exception:
+                pass
+        self._cache.clear()
 
     def cleanup(self):
         self.stop()

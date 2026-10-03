@@ -33,6 +33,7 @@ from .settings_store import SettingsStore
 from .thumbs import ThumbCache
 from .timeline_widget import TimelineWidget
 from .undo import UndoManager
+import time as _time_now
 from .wave import WaveCache
 from .model import get_filter, set_filter
 
@@ -473,6 +474,7 @@ class EditorApp:
         self.timeline.on_drag_start = self._push_undo
         self.timeline.get_wave = lambda path: self.wave_peaks.get(path)
         self.timeline.on_rightclick = self._timeline_context_menu
+        self.timeline.on_release = self._flush_seek
 
     # ================================================================ 状态记忆
     def _restore_state(self):
@@ -680,11 +682,7 @@ class EditorApp:
         # 反馈 + 滚到新片段可见（必要时自动适配整条时间轴）
         self.status_var.set(f"✅ 已加入主轨（第 {len(track.clips)} 个视频）："
                             f"{os.path.basename(path)}")
-        self.timeline.set_playhead(clip.ts, drive_timeline=False)
-        self.timeline.see_playhead()
-        if self.timeline.content_width() > self.timeline.winfo_width() * 1.6:
-            self.timeline.fit()
-            self.timeline.see_playhead()
+        self._reveal_clip(clip)
 
     def _overlay_track_append(self):
         """找最后一条画中画轨（顺序追加用）；没有则新建。"""
@@ -991,14 +989,32 @@ class EditorApp:
         h, m = divmod(m, 60)
         return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
+    def _reveal_clip(self, clip):
+        """拼完后的视图策略：
+        总片长短（可整条放下）→ 自动适配，亲眼看到时间轴变长；
+        总片长长 → 保持缩放、滚到新片段，避免整条被压成蚂蚁线。
+        """
+        try:
+            w = self.timeline.winfo_width()
+            if w <= 50:
+                return
+            total = self.project.total_duration()
+            if total * 4 <= w:
+                self.timeline.fit()
+                return
+            tw = clip.timeline_duration()
+            if tw > 0 and tw * self.timeline.pps < 60:
+                self.timeline.pps = max(60 / tw, self.timeline.pps)
+                self.timeline.refresh()
+            self.timeline.set_playhead(clip.ts, drive_timeline=False)
+            self.timeline.see_playhead()
+        except Exception:
+            pass
+
     def _on_clip_selected(self, clip):
         self._fill_props(clip)
         self._refresh_controls()
-        # 极简：选中自动弹属性窗，无选中自动收起
-        if clip is not None and not self._prop_visible:
-            self.prop_frame_recover()
-        elif clip is None and self._prop_visible:
-            self.prop_frame_recover()
+        # 不再自动弹出属性窗（需要时点工具栏「▦ 属性」）
 
     def _fill_props(self, clip):
         if clip is None:
@@ -1109,6 +1125,12 @@ class EditorApp:
             return
         if clip.speed <= 0:
             clip.speed = 1.0
+        # 常速编辑：时长跟随速度联动（否则看起来"改了没反应"）
+        if isinstance(clip, (VideoClip, AudioClip)) and not (
+                hasattr(clip, "ramp_start") and clip.ramp_start > 0):
+            span = self._src_span(clip)
+            if span > 0:
+                clip.duration = round(span / clip.speed, 3)
         if (not isinstance(clip, (ImageClip, TextClip)) and
                 clip.out_point <= clip.in_point):
             messagebox.showerror("错误", "源终点必须大于源起点。")
@@ -1250,8 +1272,8 @@ class EditorApp:
                              command=lambda: self._timeline_speed(1.25))
             menu.add_command(label="减速 ×0.8",
                              command=lambda: self._timeline_speed(0.8))
-            menu.add_command(label="重置速度 ×1",
-                             command=lambda: self._timeline_speed(1.0))
+            menu.add_command(label="重置速度 ×1（恢复常速）",
+                             command=self._timeline_speed_reset)
             menu.add_separator()
             menu.add_command(label="复制片段", command=self._copy_clip)
             menu.add_command(label="删除片段", command=self._delete_selected)
@@ -1263,6 +1285,22 @@ class EditorApp:
             menu.tk_popup(x_root, y_root)
         finally:
             menu.grab_release()
+
+    def _timeline_speed_reset(self):
+        """重置为常速（×1.0）：清渐变，时长=源区间长度。"""
+        clip = self.project.find_clip(self.timeline.selected_id or "")
+        if clip is None or isinstance(clip, (ImageClip, TextClip)):
+            return
+        self._push_undo()
+        clip.speed = 1.0
+        if hasattr(clip, "ramp_start"):
+            clip.ramp_start = clip.ramp_end = clip.ramp_dur = 0.0
+        span = self._src_span(clip)
+        if span > 0:
+            clip.duration = round(span, 3)
+        self._fill_props(clip)
+        self._after_model_change()
+        log.info("重置片段速度为常速: %s", clip.id)
 
     def _timeline_speed(self, factor: float):
         clip = self.project.find_clip(self.timeline.selected_id or "")
@@ -1642,15 +1680,12 @@ class EditorApp:
         self._refresh_controls()
 
     def _toggle_play(self):
-        """▶播放：从播放头处按整条时间轴连续播放（时长=项目总时长）。"""
-        if getattr(self.player, "_path", None):
-            if self.player._playing:
-                self.player.pause()
-            else:
-                if self._timeline_play:
-                    self.player.play()   # 时间轴模式恢复
-                else:
-                    self._play_timeline()  # 没有在播 → 从头轴模式
+        """▶播放：永远=整条时间轴连续播放（时长=项目总时长）。"""
+        if self.player._playing and self._timeline_play:
+            self.player.pause()
+            return
+        if not self._timeline_play and getattr(self.player, "_path", None):
+            self._play_timeline()   # 单段预览残留 → 切回整条时间轴
             return
         self._play_timeline()
 
@@ -1745,8 +1780,24 @@ class EditorApp:
             self.player.seek(float(val) / 100.0 * self.player.total())
 
     def _on_timeline_seek(self, sec):
-        """时间轴播放头被点击/拖动 → 定位预览（连续播放模式下保持播放）。"""
+        """时间轴播放头拖动 → 节流定位（0.15s 一跳，松手必跳准）。"""
         self.tl_time_var.set(self._fmt(sec))
+        now = _time_now.time()
+        last = getattr(self, "_last_seek", 0.0)
+        if now - last < 0.15:
+            self._pending_seek = sec
+            return
+        self._last_seek = now
+        self._pending_seek = None
+        self._do_seek(sec)
+
+    def _flush_seek(self):
+        pending = getattr(self, "_pending_seek", None)
+        if pending is not None:
+            self._pending_seek = None
+            self._do_seek(pending)
+
+    def _do_seek(self, sec):
         was_tl = self._timeline_play
         was_playing = self.player._playing
         clip = None

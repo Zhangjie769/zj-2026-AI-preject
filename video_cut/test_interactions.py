@@ -61,6 +61,7 @@ app.timeline.set_playhead(0.0)
 root.update()
 # 模拟点击时间轴 3 秒处（与 _on_timeline_seek 相同的调用路径）
 app._on_timeline_seek(3.0)
+app._flush_seek()
 for _ in range(5):
     root.update()
     time.sleep(0.02)
@@ -79,6 +80,7 @@ time.sleep(0.15)
 for _ in range(5):
     root.update()
 app._on_timeline_seek(2.0)
+app._flush_seek()
 for _ in range(5):
     root.update()
     time.sleep(0.02)
@@ -215,6 +217,92 @@ print(f"S8 总时长 {total:.1f}s ≈ 三段之和 {expected:.1f}s")
 assert abs(total - expected) < 1.0, f"S8 拼接后总时长未增长: {total} vs {expected}"
 assert app.timeline.content_width() > total * app.timeline.pps, "S8 时间轴宽未随总长增长"
 print("S8 主轨拼接总时长必增长 OK")
+
+# ============ S9: 双击单段预览后点 PLAY，必须切回整条时间轴 ============
+mt = app.project.track("main")
+first = sorted(mt.clips, key=lambda c: c.ts)[0]
+app._preview_clip(first)          # 单段预览残留
+root.update()
+assert not app._timeline_play, "S9 前置：应处于单段模式"
+app._toggle_play()                # PLAY → 必须整条时间轴
+root.update()
+assert app._timeline_play, "S9 PLAY 未切回整条时间轴"
+print("S9 PLAY 单段残留→整条时间轴 OK")
+
+# ============ S10: 标尺快速拖动节流（0.15s 内多次 seek 只执行一次，最后跳准） ============
+app._last_seek = 0.0
+app._pending_seek = None
+app.player.pause()
+app._on_timeline_seek(1.0)
+assert getattr(app, "_pending_seek", None) == 1.0 or abs(
+    app.timeline.playhead - 1.0) < 0.1, "S10 节流逻辑异常"
+app._on_timeline_seek(2.0)   # 0.15s 内 → 挂起
+assert getattr(app, "_pending_seek", None) == 2.0, "S10 未挂起最近一次拖动"
+app._flush_seek()
+assert abs(app.timeline.playhead - 2.0) < 0.1, "S10 松开未跳准"
+print("S10 标尺拖动节流 OK")
+
+# ============ S11: 单击片段 = 跳转（不移动、不弹属性窗） ============
+mt = app.project.track("main")
+c = sorted(mt.clips, key=lambda cc: cc.ts)[0]
+ts_before = c.ts
+app.timeline.set_playhead(0.0, drive_timeline=False)
+# 模拟在片段中部的单击（按下+松开，无移动）
+xw = int(app.timeline.canvasx(5.0 * app.timeline.pps))
+yw = 26 + 23
+evt_down = type("e", (), {"x": xw, "y": yw, "x_root": 0, "y_root": 0,
+                          "delta": 0, "state": 0})()
+evt_up = type("e", (), {"x": xw, "y": yw, "x_root": 0, "y_root": 0,
+                        "delta": 0, "state": 0})()
+app.timeline._on_press(evt_down)
+app.timeline._on_release(evt_up)
+root.update()
+assert abs(app.timeline.playhead - 5.0) < 0.3, f"S11 单击未跳转: {app.timeline.playhead}"
+assert c.ts == ts_before, "S11 单击不应移动片段"
+assert not getattr(app, "_prop_visible", True), "S11 单击不应弹属性窗"
+print("S11 单击=跳转(不弹窗) OK")
+
+# ============ S12: 短片拼接后视图自动适配，且能看到总长增长 ============
+app.undo.clear()
+app.project = _P()
+app.timeline.project = app.project
+root.update()
+for v in vlist:
+    pick(v)
+    app._media_add_main()
+    root.update()
+total = app.project.total_duration()
+assert total == 24.0, f"S12 总长应=24s: {total}"
+wsz = app.timeline.winfo_width()
+if wsz > 50:
+    assert app.timeline.content_width() <= wsz * 1.15 or \
+        total * 4 <= wsz, "S12 短片应可整条可见"
+print(f"S12 视图适配 OK（总长 {total}s）")
+
+# ============ S13: 重置速度 = 常速（修复"乘1没反应"） ============
+mt = app.project.track("main")
+c = sorted(mt.clips, key=lambda cc: cc.ts)[0]
+c.speed = 2.0
+app.timeline.select(c.id)
+root.update()
+app._timeline_speed_reset()
+root.update()
+assert c.speed == 1.0, f"S13 重置后非 1.0: {c.speed}"
+span = app._src_span(c)
+assert abs(c.duration - span) < 0.05, f"S13 时长未回源区间: {c.duration} vs {span}"
+print("S13 重置速度=常速 OK")
+
+# S13b: 属性面板改速度 → 时长联动
+c.speed = 1.0
+app.timeline.select(c.id)
+root.update()
+base_dur = c.duration
+app.prop_vars["speed"].set("2.0")
+app._apply_props()
+root.update()
+assert c.speed == 2.0, "S13b 速度未应用"
+assert abs(c.duration - base_dur / 2.0) < 0.05, f"S13b 时长未联动: {c.duration}"
+print("S13b 属性改速联动时长 OK")
 
 print("=== INTERACTIONS PASS ===")
 app._on_close()

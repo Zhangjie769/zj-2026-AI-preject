@@ -69,6 +69,7 @@ class TimelineWidget(tk.Canvas):
         self.bind("<Button-1>", self._on_press)
         self.bind("<MouseWheel>", self._on_wheel)
         self.on_rightclick = None   # cb(clip | None, x_root, y_root)
+        self.on_release = None      # cb() 松手（供 app 冲刷节流 seek）
         self.bind("<B1-Motion>", self._on_drag)
         self.bind("<ButtonRelease-1>", self._on_release)
         self.bind("<Double-Button-1>", self._on_double)
@@ -307,50 +308,65 @@ class TimelineWidget(tk.Canvas):
         return None
 
     def _on_press(self, evt):
-        x, y = int(self.canvasx(evt.x)), int(self.canvasy(evt.y))
-        # 播放头/标尺 → seek
-        if y < HEADER_H:
-            self.set_playhead(x / self.pps)
-            self._drag = {"mode": "seek"}
+        cx, cy = int(self.canvasx(evt.x)), int(self.canvasy(evt.y))
+        self._press = {"x": cx, "y": cy, "clip": None, "moving": False,
+                       "mode": None, "x0": 0.0, "x1": 0.0}
+        if cy < HEADER_H:
+            self.set_playhead(cx / self.pps)
+            self._press["mode"] = "seek"
             return
-        hit = self._hit_clip(x, y)
+        hit = self._hit_clip(cx, cy)
         if hit is None:
-            self.set_playhead(x / self.pps)
+            self.set_playhead(cx / self.pps)
+            self._press["mode"] = "seek"
             self.select(None)
-            self._drag = {"mode": "seek"}
             return
         clip, x0, x1 = hit
         self.select(clip.id)
-        edge = 5.0
-        if abs(x - x0) <= edge:
-            mode = "trim_l"
-        elif abs(x - x1) <= edge:
-            mode = "trim_r"
-        else:
-            mode = "move"
-        self._drag = {
-            "mode": mode, "clip_id": clip.id,
-            "start_x": x, "start_ts": clip.ts,
-            "start_in": getattr(clip, "in_point", 0),
-            "start_out": getattr(clip, "out_point", clip.timeline_duration()),
-            "start_dur": clip.timeline_duration(),
-        }
-        if self.on_drag_start:
-            self.on_drag_start()
+        self._press["clip"] = clip
+        self._press["x0"], self._press["x1"] = x0, x1
 
     def _on_drag(self, evt):
-        if self._drag is None:
+        p = getattr(self, "_press", None)
+        if p is None:
             return
+        cx, cy = int(self.canvasx(evt.x)), int(self.canvasy(evt.y))
+        if p["mode"] == "seek":
+            self.set_playhead(cx / self.pps)
+            return
+        if p["clip"] is None:
+            return
+        # 阈值判定：小于 8px 视为单击（跳转），超过才进入拖动
+        if not p["moving"]:
+            if abs(cx - p["x"]) < 8 and abs(cy - p["y"]) < 8:
+                return
+            p["moving"] = True
+            clip = p["clip"]
+            edge = 5.0
+            if abs(cx - p["x0"]) <= edge:
+                mode = "trim_l"
+            elif abs(cx - p["x1"]) <= edge:
+                mode = "trim_r"
+            else:
+                mode = "move"
+            self._drag = {
+                "mode": mode, "clip_id": clip.id,
+                "start_x": p["x"],
+                "start_ts": clip.ts,
+                "start_in": getattr(clip, "in_point", 0),
+                "start_out": getattr(clip, "out_point",
+                                      clip.timeline_duration()),
+                "start_dur": clip.timeline_duration(),
+            }
+            if self.on_drag_start:
+                self.on_drag_start()
         d = self._drag
+        if d is None:
+            return
         clip = self.project.find_clip(d["clip_id"])
         if clip is None:
             return
-        cx = self.canvasx(evt.x)
         dx = (cx - d["start_x"]) / self.pps
-
-        if d["mode"] == "seek":
-            self.set_playhead(self.canvasx(evt.x) / self.pps)
-            return
 
         if d["mode"] == "move":
             new_ts = max(0.0, round(d["start_ts"] + dx, 2))
@@ -369,8 +385,9 @@ class TimelineWidget(tk.Canvas):
 
         elif d["mode"] == "trim_r":
             new_dur = max(0.2, round(d["start_dur"] + dx, 2))
-            edge = self._snap(d["start_ts"] + new_dur, except_clip_id=clip.id)
-            clip.duration = max(0.2, round(edge - clip.ts, 2))
+            edge_t = self._snap(d["start_ts"] + new_dur,
+                                except_clip_id=clip.id)
+            clip.duration = max(0.2, round(edge_t - clip.ts, 2))
             if hasattr(clip, "out_point") and not isinstance(clip, ImageClip) \
                     and not isinstance(clip, AudioClip):
                 spd = clip.speed if clip.speed > 0 else 1.0
@@ -381,21 +398,28 @@ class TimelineWidget(tk.Canvas):
             self.on_clips_changed()
 
     def _on_release(self, _evt):
+        p = getattr(self, "_press", None)
+        self._press = None
+        if p is not None and not p["moving"] and p["mode"] is None \
+                and p["clip"] is not None:
+            # 单击片段 = 跳转到该时间点（不再弹出任何面板）
+            cx = int(self.canvasx(_evt.x))
+            self.set_playhead(cx / self.pps)
         self._drag = None
+        if self.on_release:
+            self.on_release()
 
     def _on_wheel(self, evt):
         """滚轮=横向滚动；Ctrl+滚轮=缩放。"""
-        if evt.state & 0x4:  # Ctrl 按下 → 缩放
+        if evt.state & 0x4:
             self.zoom(1.15 if evt.delta > 0 else 0.87)
             return
-        dx = -evt.delta / 120 * 60.0   # 每格滚动 60px
+        dx = -evt.delta / 120 * 60.0
         cw = self.content_width()
         cur = self.xview()[0]
-        frac = max(0.0, min(1.0, dx / max(cw, 1)))
-        self.xview_moveto(max(0.0, min(1.0, cur + frac)))
+        self.xview_moveto(max(0.0, min(1.0, cur + dx / max(cw, 1))))
 
     def hit_clip_at(self, x, y):
-        """公开命中查询（供右键菜单等外部使用）。"""
         hit = self._hit_clip(x, y)
         return hit[0] if hit else None
 
