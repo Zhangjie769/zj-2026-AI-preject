@@ -23,6 +23,10 @@ logs/
 *.log
 thumbs_cache/
 
+# ---- Runtime data (video_cut) ----
+autosave.vcp
+settings.json
+
 # ---- Large data files (超出 GitHub 限制或可重新生成) ----
 # shape_search 的数据文件，可通过 save_npy.py / build_data_new.py 重新生成
 *.npy
