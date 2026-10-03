@@ -1,0 +1,7 @@
+next
+(5,1)=1
+next
+(5,1)=0
+next
+show
+quit
