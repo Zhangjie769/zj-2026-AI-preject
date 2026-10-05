@@ -1,6 +1,7 @@
 ﻿# -*- coding: utf-8 -*-
 """UI 冒烟测试：实例化 EditorApp，驱动若干轮事件循环，确认无异常，然后退出。"""
 import os
+import subprocess
 import sys
 import tkinter as tk
 
@@ -12,6 +13,8 @@ root = tk.Tk()
 root.withdraw()  # 不显示窗口也能初始化
 
 app = EditorApp(root)
+app.settings.set("guide_shown", True)
+app.background_tasks = False  # 测试用同步模式
 for _ in range(30):
     root.update()
     root.after(20)
@@ -55,8 +58,17 @@ root.update()
 assert len(app.project.all_clips()) == 2, "添加画中画片段失败"
 
 # 音频轨：用"双击自动入轨"路径添加（新交互）
-if music in paths:
-    idx = paths.index(music)
+mp3 = os.path.join(sample_dir, "music.mp3")
+if not os.path.isfile(mp3):
+    # 从 v1.mp4 里抽出音频转成 mp3（纯音频素材）
+    subprocess.run([r"tools\ffmpeg\bin\ffmpeg.exe", "-y", "-v", "error",
+                    "-i", v1, "-vn", "-c:a", "libmp3lame", "-q:a", "4", mp3],
+                   capture_output=True)
+app._refresh_media()
+root.update()
+paths = [p for _, p in app.media_files]  # 重新扫描后更新
+if mp3 in paths:
+    idx = paths.index(mp3)
     app.media_list.selection_set(str(idx))
     root.update()
     app._media_add_auto()
@@ -64,7 +76,14 @@ if music in paths:
     assert len(app.project.all_clips()) == 3, "添加音频片段失败"
     from editor.model import AudioClip
     assert any(isinstance(c, AudioClip) for c in app.project.all_clips()), "音频类型错误"
-    print("双击自动入轨(音频) OK")
+    # 预览装载纯音频（不崩、能准备声音）
+    ac = [c for c in app.project.all_clips() if isinstance(c, AudioClip)][0]
+    app._preview_clip(ac)
+    root.update()
+    assert app.player._path == ac.src, "纯音频预览未装载"
+    print("mp3/音频 全链路 OK")
+else:
+    print("mp3 未生成，跳过（检查 ffmpeg）")
 
 # 画中画顺序化：连加两个画中画，时间轴 ts 不应重叠（叠着是 bug）
 app.media_list.selection_set(str(paths.index(v1)))

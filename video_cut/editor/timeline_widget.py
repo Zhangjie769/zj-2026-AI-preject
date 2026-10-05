@@ -22,8 +22,21 @@ from .model import AudioClip, Clip, ImageClip, Project, TextClip
 
 HEADER_H = 26          # 标尺高度
 TRACK_H = 46           # 每轨高度
-MIN_PPS = 1.0          # 最小像素/秒（fit 时动态算）
+MIN_PPS = 0.01         # 最小像素/秒（长视频可缩到一屏）
 MAX_PPS = 400.0
+
+# 标尺"好看"的间隔候选（秒）：1s/2s/5s/10s/15s/30s/1分/2分/5分/10分/15分/30分/1时…
+_TICK_STEPS = [0.5, 1, 2, 5, 10, 15, 20, 30, 60, 120, 180, 300, 600, 900,
+               1200, 1800, 3600, 7200, 10800, 21600, 43200, 86400]
+
+
+def nice_step(sec: float) -> float:
+    """从候选里挑一个 >= sec 的"好看"刻度间隔。"""
+    sec = max(sec, 1e-6)
+    for s in _TICK_STEPS:
+        if s >= sec:
+            return float(s)
+    return float(_TICK_STEPS[-1])
 
 TRACK_COLORS = {
     "main":    "#4a7a55",
@@ -54,6 +67,7 @@ class TimelineWidget(tk.Canvas):
         self.pps = 12.0                # 像素/秒
         self.playhead = 0.0            # 播放头位置（秒）
         self.selected_id: Optional[str] = None
+        self._multi: set = set()   # 多选片段 id 集合
         self.snap_enabled = True       # 磁吸开关（应用可切换）
         self.snap_px = 8.0             # 磁吸容差（像素）
         self.on_select = None          # cb(clip | None)
@@ -70,6 +84,11 @@ class TimelineWidget(tk.Canvas):
         self.bind("<MouseWheel>", self._on_wheel)
         self.on_rightclick = None   # cb(clip | None, x_root, y_root)
         self.on_release = None      # cb() 松手（供 app 冲刷节流 seek）
+        self.on_move_track = None   # cb(clip, row_kind) 跨轨拖拽落到某轨道
+        self._dragging = False      # 拖动中（轻量绘制用）
+        self._edit_dirty = False    # 拖动是否真正改过片段（松手提交）
+        self.on_edit_commit = None  # cb() 松手提交（autosave/控件刷新）
+        self._press_row = None      # 按下时所在轨道行 kind
         self.bind("<B1-Motion>", self._on_drag)
         self.bind("<ButtonRelease-1>", self._on_release)
         self.bind("<Double-Button-1>", self._on_double)
@@ -108,22 +127,25 @@ class TimelineWidget(tk.Canvas):
         self.delete("all")
         total = self.project.total_duration()
 
-        # 背景刻度线
-        step = 10
-        if self.pps >= 60:
-            step = 1
-        elif self.pps >= 20:
-            step = 5
-        for s in range(0, int(total) + 1, step):
-            x = s * self.pps
-            self.create_line(x, HEADER_H - 12, x, HEADER_H, fill="#5a5a5a")
-            self.create_line(x, HEADER_H, x, self.height_needed(), fill="#2e2e2e")
-        # 标尺时间文字
-        for s in range(0, int(total) + 1, max(step, 1)):
-            x = s * self.pps
-            if s % (step * 5) == 0 or step == 1:
-                self.create_text(x + 3, 4, text=fmt_time(s), anchor="nw",
+        # 背景刻度线（等比例自适应：按每秒像素数选"好看"的间隔）
+        major = nice_step(90.0 / max(self.pps, 1e-6))   # 主刻度至少间隔 90px
+        minor = major / 5.0 if major >= 5 else major
+        t = 0.0
+        # 防止极端数量（安全上限）
+        guard = 0
+        while t <= total + minor and guard < 20000:
+            guard += 1
+            x = t * self.pps
+            is_major = (abs(t / major - round(t / major)) < 1e-6)
+            self.create_line(x, HEADER_H - (12 if is_major else 7),
+                             x, HEADER_H,
+                             fill="#7a7a7a" if is_major else "#4a4a4a")
+            self.create_line(x, HEADER_H, x, self.height_needed(),
+                             fill="#2e2e2e")
+            if is_major:
+                self.create_text(x + 3, 4, text=fmt_time(t), anchor="nw",
                                  fill="#9e9e9e", font=("Consolas", 9))
+            t = t + minor
         # 总时长标记（在内容末尾）
         self.create_text(self.content_width() - 8, 4, anchor="ne",
                          text=f"▍总长 {fmt_time(total)}",
@@ -144,11 +166,11 @@ class TimelineWidget(tk.Canvas):
             self.create_text(6, y0 + 4, anchor="nw", text=label,
                              fill=color, font=("Microsoft YaHei UI", 9, "bold"))
             for clip in sorted(track.clips, key=lambda c: c.ts):
-                self._draw_clip(clip, y0, y1)
+                self._draw_clip(clip, y0, y1, light=self._dragging)
 
         self._draw_playhead()
 
-    def _draw_clip(self, clip: Clip, y0, y1):
+    def _draw_clip(self, clip: Clip, y0, y1, light: bool = False):
         x0 = clip.ts * self.pps
         x1 = (clip.ts + clip.timeline_duration()) * self.pps
         if isinstance(clip, ImageClip):
@@ -160,7 +182,7 @@ class TimelineWidget(tk.Canvas):
         else:
             color = TRACK_COLORS.get(self._track_of(clip).kind, "#999")
         tag = f"clip_{clip.id}"
-        sel = 2 if clip.id == self.selected_id else 0
+        sel = 2 if (clip.id in self._multi or clip.id == self.selected_id) else 0
         self.create_rectangle(x0 + 2, y0 + 14, x1 - 2, y1 - 4,
                               fill=color, outline=SEL_OUTLINE if sel else "#000",
                               width=sel, tags=(tag, "clip"))
@@ -179,7 +201,7 @@ class TimelineWidget(tk.Canvas):
             self.create_text(x0 + 8, y0 + (TRACK_H - 14) / 2 + 14, anchor="w",
                              text=name, fill="#e8e8e8",
                              font=("Microsoft YaHei UI", 9), tags=(tag,))
-        # 迷你缩略图（视频片段，一块方便认内容的胶片）
+        # 迷你缩略图（视频片段；缩略图为缓存图，拖动中也保留）
         if (not isinstance(clip, (AudioClip, TextClip)) and
                 x1 - x0 > 72 and self.get_thumb is not None):
             try:
@@ -204,8 +226,8 @@ class TimelineWidget(tk.Canvas):
             self.create_text(x1 - 4, y0 + 16, anchor="ne", text=tmark,
                              fill="#7ee787", font=("Microsoft YaHei UI", 8),
                              tags=(tag,))
-        # 音频波形
-        if isinstance(clip, AudioClip) and self.get_wave is not None:
+        # 音频波形（拖动中跳过以保流畅）
+        if not light and isinstance(clip, AudioClip) and self.get_wave is not None:
             self._draw_wave(clip, x0, x1, y0, y1, tag)
 
     def _draw_wave(self, clip: AudioClip, x0, x1, y0, y1, tag):
@@ -321,8 +343,25 @@ class TimelineWidget(tk.Canvas):
             self._press["mode"] = "seek"
             self.select(None)
             return
+        self._press_row = None
+        for t, y0, y1 in self.track_rows():
+            if y0 <= cy < y1:
+                self._press_row = t.kind
+                break
         clip, x0, x1 = hit
-        self.select(clip.id)
+        if evt.state & 0x4:          # Ctrl：追加/切换多选
+            if clip.id in self._multi:
+                self._multi.discard(clip.id)
+            else:
+                self._multi.add(clip.id)
+            self.selected_id = clip.id if clip.id in self._multi else (
+                next(iter(self._multi), None))
+            self.refresh()
+            if self.on_select:
+                self.on_select(self.find_clip(self.selected_id or ""))
+        else:
+            self._multi = {clip.id}
+            self.select(clip.id)
         self._press["clip"] = clip
         self._press["x0"], self._press["x1"] = x0, x1
 
@@ -366,6 +405,17 @@ class TimelineWidget(tk.Canvas):
         clip = self.project.find_clip(d["clip_id"])
         if clip is None:
             return
+        # 跨轨拖拽：纵向超过半条轨高 → 换轨（一次即可，防抖动）
+        for t, y0, y1 in self.track_rows():
+            if y0 <= cy < y1 and t.kind != self._press_row and \
+                    abs(cy - p["y"]) > 20:
+                if self.on_move_track:
+                    self.on_move_track(clip, t.kind)
+                self._press_row = t.kind
+                self._drag = None
+                self._dragging = False
+                return
+        self._dragging = True
         dx = (cx - d["start_x"]) / self.pps
 
         if d["mode"] == "move":
@@ -393,13 +443,22 @@ class TimelineWidget(tk.Canvas):
                 spd = clip.speed if clip.speed > 0 else 1.0
                 clip.out_point = d["start_in"] + clip.duration * spd
 
+        self._edit_dirty = True
         self.refresh()
         if self.on_clips_changed:
             self.on_clips_changed()
 
     def _on_release(self, _evt):
+        lightweight = self._dragging
+        self._dragging = False
         p = getattr(self, "_press", None)
         self._press = None
+        if lightweight:
+            self.refresh()   # 拖动结束：恢复全量绘制
+        if getattr(self, "_edit_dirty", False):
+            self._edit_dirty = False
+            if self.on_edit_commit:
+                self.on_edit_commit()
         if p is not None and not p["moving"] and p["mode"] is None \
                 and p["clip"] is not None:
             # 单击片段 = 跳转到该时间点（不再弹出任何面板）
@@ -435,6 +494,26 @@ class TimelineWidget(tk.Canvas):
         """像素→时间：供拖拽落点换算。"""
         return max(x / self.pps, 0.0)
 
+    def set_drop_hint(self, sec: float):
+        """拖拽落点提示：竖线 + '放这里'。"""
+        try:
+            self.delete("drophint")
+            x = max(sec, 0.0) * self.pps
+            self.create_line(x, HEADER_H, x, self.height_needed(),
+                             fill="#4a9eff", width=2, dash=(5, 3),
+                             tags="drophint")
+            self.create_text(x + 4, HEADER_H + 4, anchor="nw", text="放这里",
+                             fill="#4a9eff", font=("Microsoft YaHei UI", 9),
+                             tags="drophint")
+        except Exception:
+            pass
+
+    def clear_drop_hint(self):
+        try:
+            self.delete("drophint")
+        except Exception:
+            pass
+
     def _on_right(self, evt):
         clip = self.hit_clip_at(self.canvasx(evt.x), self.canvasy(evt.y))
         if clip is not None:
@@ -442,8 +521,16 @@ class TimelineWidget(tk.Canvas):
         if self.on_rightclick:
             self.on_rightclick(clip, evt.x_root, evt.y_root)
 
+    def selected_ids(self) -> list:
+        """当前选中（含多选）的片段 id 列表。"""
+        ids = sorted(self._multi) if self._multi else []
+        if self.selected_id and self.selected_id not in ids:
+            ids.append(self.selected_id)
+        return ids
+
     def select(self, clip_id: Optional[str], notify: bool = True):
         self.selected_id = clip_id
+        self._multi = {clip_id} if clip_id else set()
         self.refresh()
         if notify and self.on_select:
             clip = self.project.find_clip(clip_id) if clip_id else None

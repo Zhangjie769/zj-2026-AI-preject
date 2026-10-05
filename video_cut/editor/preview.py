@@ -239,7 +239,8 @@ class PreviewPlayer:
              speed: float = 1.0, target_w: int = 0, target_h: int = 0,
              audio_src: str | None = None,
              audio_in: float = 0.0, audio_len: float = 0.0,
-             audio_vol: float = 1.0):
+             audio_vol: float = 1.0,
+             src_w: int = 0, src_h: int = 0, fps: float = 0.0):
         self._stop_all()
         self.audio.stop()
         if self._aud_wav:
@@ -251,11 +252,14 @@ class PreviewPlayer:
         self._speed = speed if speed > 0 else 1.0
         self._pos = 0.0
         self._ended = False
-        self._fps = self._probe_fps(path) or 30.0
+        self._src_w, self._src_h = int(src_w), int(src_h)
+        self._fps = fps or (self._probe_fps(path) or 30.0)
         self._interlaced = getattr(self, "_interlaced", False)
         self._last_tick = _time.monotonic()
 
-        _sz, self._interlaced = self._probe_video(path)
+        if self._src_w <= 0 or self._src_h <= 0:
+            sz, self._interlaced = self._probe_video(path)
+            self._src_w, self._src_h = sz
         w, h = self._fit_keep_aspect(path, target_w, target_h)
         self.w, self.h = w, h
         self._gen += 1
@@ -342,7 +346,7 @@ class PreviewPlayer:
         vf = []
         if getattr(self, "_interlaced", False):
             vf.append("yadif=1")
-        vf.append(f"scale={self.w}:{self.h}:force_original_aspect_ratio=decrease:flags=lanczos")
+        vf.append(f"scale={self.w}:{self.h}:flags=lanczos")
         vf.append("setsar=1")
         if abs(self._speed - 1.0) > 1e-3:
             vf.append(f"setpts=PTS/{self._speed:.4f}")
@@ -456,17 +460,21 @@ class PreviewPlayer:
         return target_w, target_h
 
     def _fit_keep_aspect(self, path, target_w, target_h):
-        """按源视频宽高比适配预览尺寸（竖屏/横屏都不变形）。"""
+        """预览解码尺寸自适应：
+        - 大素材：缩到 960x540 盒子内（保证清晰又省算力）
+        - 小素材：按源尺寸解码（不大于源，不硬放大→又慢又糊）
+        """
         tw, th = self._fit_size(target_w, target_h)
-        sw, sh = self._probe_size(path)
+        sw, sh = getattr(self, "_src_w", 0), getattr(self, "_src_h", 0)
+        if sw <= 0 or sh <= 0:
+            sw, sh = self._probe_size(path)
         if sw > 0 and sh > 0:
-            scale = min(tw / sw, th / sh)
-            nw = int(sw * scale)
-            nh = int(sh * scale)
+            scale = min(tw / sw, th / sh, 1.0)   # 从不超过原分辨率
+            nw = max(int(sw * scale), 320)
+            nh = max(int(sh * scale), 180)
             nw -= nw % 2
             nh -= nh % 2
-            if nw >= 4 and nh >= 4:
-                return nw, nh
+            return nw, nh
         return tw, th
 
     def set_overlays(self, specs):
@@ -482,12 +490,24 @@ class PreviewPlayer:
 
     def _start_overlay(self, key, s):
         try:
-            tw = max(int(self.w * s["w_frac"] * 2), 120)   # 2x 超采样解码
-            th = max(int(self.h * s["h_frac"] * 2), 80)
             is_img = os.path.splitext(s["src"])[1].lower() in (
                 ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
-            vf = (f"scale={tw}:{th}:force_original_aspect_ratio=decrease"
-                  f":flags=lanczos,setsar=1")
+            # 先算"显示尺寸"dw x dh（保持源比例，落在盒子内）
+            box_w = max(int(self.w * s["w_frac"]), 8)
+            box_h = max(int(self.h * s["h_frac"]), 8)
+            sw = int(s.get("src_w", 0))
+            sh = int(s.get("src_h", 0))
+            if sw > 0 and sh > 0:
+                sc = min(box_w / sw, box_h / sh)
+                dw = max(int(sw * sc) & ~1, 2)
+                dh = max(int(sh * sc) & ~1, 2)
+            else:
+                dw, dh = box_w, box_h
+            # 解码用 2x 超采样（显示尺寸的 2 倍），读帧尺寸与之严格一致
+            tw = max(dw * 2, 4)
+            th = max(dh * 2, 4)
+            s["dw"], s["dh"] = dw, dh
+            vf = f"scale={tw}:{th}:flags=lanczos,setsar=1"
             if is_img:
                 # 图片源：-loop 1 循环出帧（-ss 对静态图无效）
                 cmd = [self.ffmpeg, "-v", "error", "-nostdin", "-threads", "2",
@@ -511,7 +531,7 @@ class PreviewPlayer:
         th = threading.Thread(target=self._overlay_reader,
                               args=(proc, q, tw, th), daemon=True)
         th.start()
-        self._overlays[key] = [proc, th, q, None]
+        self._overlays[key] = [proc, th, q, None, dw, dh]
 
     def _overlay_reader(self, proc, q, tw, th):
         fb = tw * th * 3
@@ -567,12 +587,10 @@ class PreviewPlayer:
             spec = getattr(self, "_ov_spec", {}).get(k)
             if spec is None:
                 continue
-            # 2x 超采样帧 → LANCZOS 缩到目标尺寸再贴，边缘不锯齿
-            tw = max(int(self.w * spec.get("w_frac", 0.2)), 4)
-            th = max(int(self.h * spec.get("h_frac", 0.2)), 4)
+            dw, dh = entry[4], entry[5]
             ov = last
-            if ov.size != (tw, th):
-                ov = ov.resize((tw, th), Image.LANCZOS)
+            if ov.size != (dw, dh):
+                ov = ov.resize((dw, dh), Image.LANCZOS)
             ov = ov.convert("RGBA")
             x = int(spec["x_frac"] * self.w)
             y = int(spec["y_frac"] * self.h)

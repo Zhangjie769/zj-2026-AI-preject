@@ -24,7 +24,8 @@ from tkinter import ttk, filedialog, messagebox
 from . import __version__, resolve_ffmpeg, resolve_ffprobe
 from .theme import apply_dark_theme
 from . import logger as _logmod
-from .engine import Engine, RenderError, TRANSITIONS, atempo_chain
+from .engine import Engine, RenderError, TRANSITIONS
+from PIL import Image as _PILImage
 from .model import (AudioClip, ImageClip, Project, TextClip, VideoClip,
                     get_filter, set_filter)
 from .preview import PreviewPlayer
@@ -99,6 +100,13 @@ class EditorApp:
         self.wave_peaks: dict = {}          # path -> peaks
         self.thumb_photos: dict = {}        # path -> PhotoImage（防回收）
         self._thumb_kind: dict = {}         # path -> kind
+        self.background_tasks = True        # 重活是否放后台线程（测试可设 False）
+        self._task_busy = False
+        self._task_name = ""
+        self._busy_mask = None
+        self._busy_lbl = None
+        self._title_base = None
+        self.ui_q: "queue.Queue" = queue.Queue()   # 后台线程 → UI 线程 的任务队列
 
         self._build_ui()
         self._restore_state()
@@ -109,6 +117,29 @@ class EditorApp:
         self.root.after(33, self._preview_tick)
         self.root.after(2000, self._auto_refresh_media)
         self.root.after(150, self._refresh_controls)
+        self._bind_shortcuts()
+        self.root.after(700, self._maybe_show_guide)
+
+    def _bind_shortcuts(self):
+        """集中键盘快捷键（曾因补丁被误删，现统一回归）。"""
+        r = self.root
+        r.bind("<Control-z>", lambda e: self._undo())
+        r.bind("<Control-Z>", lambda e: self._undo())
+        r.bind("<Control-y>", lambda e: self._redo())
+        r.bind("<Control-Y>", lambda e: self._redo())
+        r.bind("<Control-o>", lambda e: self._open_project())
+        r.bind("<Control-O>", lambda e: self._open_project())
+        r.bind("<Control-s>", lambda e: self._save_project())
+        r.bind("<Control-S>", lambda e: self._save_project())
+        r.bind("<Control-c>", lambda e: self._copy_clip())
+        r.bind("<Control-C>", lambda e: self._copy_clip())
+        r.bind("<Control-v>", lambda e: self._paste_clip())
+        r.bind("<Control-V>", lambda e: self._paste_clip())
+        r.bind("<Delete>", lambda e: self._delete_selected())
+        r.bind("<space>", lambda e: self._toggle_play())
+        r.bind("<F5>", lambda e: self._refresh_media())
+        r.bind("<Up>", lambda e: self._cycle_selection(-1))
+        r.bind("<Down>", lambda e: self._cycle_selection(1))
 
     def _app_dir(self) -> str:
         """数据目录：源码运行=项目根；打包运行=exe 同目录。"""
@@ -171,8 +202,10 @@ class EditorApp:
                                                        padx=6)
         tbtn("⚡ 快速成片", self._quick_produce_dialog,
              "选素材→自动拼接→导出，三步成片")
-        self.tbtn_render = tbtn("🎬 导出渲染", self._render_project,
-                                "渲染导出成品")
+        self.tbtn_render = tbtn("🎬 导出视频", self._render_project,
+                                "导出成品视频（格式/画质/输出位置可调）")
+        tbtn("⟳ 预览", self._preview_refresh,
+             "手动刷新预览（编辑轨道不会自动打断预览）")
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y",
                                                        padx=6)
         tbtn("↩ 撤销", self._undo, "撤销（Ctrl+Z）")
@@ -181,8 +214,8 @@ class EditorApp:
                                                        padx=6)
         tbtn("◧ 画布", self._project_settings,
              "分辨率/帧率设置（例如 1920×1080、竖屏 9:16）")
-        tbtn("▦ 属性", self.prop_frame_recover,
-             "开关片段属性窗（选中片段时自动弹出）")
+        tbtn("▦ 侧栏", self.prop_frame_recover,
+             "显示/隐藏右侧侧栏（画中画大小/速度/音量/导出）")
         tbtn("🗂 图层", self._layers_dialog,
              "图层面板：显示/隐藏、调整堆叠顺序、删轨道")
         tbtn("✂ 删除", self._delete_selected, "删除选中片段（Delete）")
@@ -206,18 +239,36 @@ class EditorApp:
                                             command=self._refresh_media)
         self.btn_refresh_media.pack(side="left", padx=(3, 0))
 
-        self.media_list = ttk.Treeview(left, columns=("thumb", "name"), show="tree",
-                                   height=14)
+        style = ttk.Style(self.root)
+        try:
+            style.configure("Media.Treeview", rowheight=58,
+                            font=("Microsoft YaHei UI", 9))
+            style.configure("Media.Treeview.Item",
+                            padding=(4, 2))
+        except Exception:
+            pass
+        media_body = ttk.Frame(left)
+        media_body.pack(fill="both", expand=True, padx=6, pady=4)
+        self.media_list = ttk.Treeview(media_body, columns=("name",),
+                                       show="tree", height=14,
+                                       style="Media.Treeview")
         self.media_list.heading("#0", text="")
-        self.media_list.column("#0", width=104, stretch=False)
+        self.media_list.column("#0", width=116, stretch=False)
         self.media_list.heading("name", text="素材（双击加主轨）")
-        self.media_list.column("thumb", width=0, stretch=False)
-        self.media_list.pack(fill="both", expand=True, padx=6, pady=4)
+        self.media_list.column("name", width=140, stretch=True)
+        self.media_list.pack(side="left", fill="both", expand=True)
+        media_scroll = ttk.Scrollbar(media_body, orient="vertical",
+                                     command=self.media_list.yview)
+        media_scroll.pack(side="right", fill="y")
+        self.media_list.configure(yscrollcommand=media_scroll.set)
         self.media_list.bind("<Double-Button-1>", lambda e: self._media_add_auto())
         self.media_list.bind("<Button-3>", self._media_context_menu)
         self.media_list.bind("<ButtonPress-1>", self._media_drag_press)
+        self.media_list.bind("<B1-Motion>", self._media_drag_motion)
         self.media_list.bind("<ButtonRelease-1>", self._media_drag_release)
         self._media_drag_path = None
+        self._drag_ghost = None
+        self._drag_ghost_photo = None
         self.media_list.bind("<<TreeviewSelect>>", self._media_select_changed)
         self.media_files: list = []
 
@@ -281,151 +332,232 @@ class EditorApp:
                                        command=self._audition)
         self.btn_audition.pack(side="left", padx=(8, 0))
 
-        # ---- 属性面板 ----
-        self.prop_win = tk.Toplevel(self.root)
-        self.prop_win.title("片段属性")
-        self.prop_win.geometry("460x560")
-        self.prop_win.withdraw()
-        self.prop_win.protocol("WM_DELETE_WINDOW", self._prop_win_close)
-        prop = ttk.LabelFrame(self.prop_win, text="片段属性（无选中自动收起）")
+        # ---- 属性侧栏（右侧固定，可滚动）：片段属性 + 画中画 + 导出 ----
+        self.main_paned = main
+        self.side = ttk.Frame(main, width=352)
+        main.add(self.side, weight=0)
+
+        side_wrap = ttk.Frame(self.side)
+        side_wrap.pack(fill="both", expand=True)
+        try:
+            _side_bg = ttk.Style(self.root).lookup("TFrame", "background")
+        except Exception:
+            _side_bg = ""
+        self._side_canvas = tk.Canvas(side_wrap, bg=_side_bg or "#f0f0f0",
+                                      highlightthickness=0, width=336)
+        side_scroll = ttk.Scrollbar(side_wrap, orient="vertical",
+                                    command=self._side_canvas.yview)
+        self._side_inner = ttk.Frame(self._side_canvas)
+        self._side_inner.bind(
+            "<Configure>",
+            lambda e: self._side_canvas.configure(
+                scrollregion=self._side_canvas.bbox("all")))
+        self._side_win_id = self._side_canvas.create_window(
+            (0, 0), window=self._side_inner, anchor="nw")
+        self._side_canvas.bind(
+            "<Configure>",
+            lambda e: self._side_canvas.itemconfigure(self._side_win_id,
+                                                      width=e.width))
+        self._side_canvas.configure(yscrollcommand=side_scroll.set)
+        self._side_canvas.pack(side="left", fill="both", expand=True)
+        side_scroll.pack(side="right", fill="y")
+        self.root.bind_all("<MouseWheel>", self._side_scroll_wheel, add="+")
+        self._prop_visible = True
+
+        # ===== 导出成片（放最上面：一眼看到"视频放哪、点哪导出"）=====
+        exp_side = ttk.LabelFrame(self._side_inner,
+                                  text="导出成片（成品放这里）")
+        exp_side.pack(fill="x", padx=4, pady=(4, 4))
+        ttk.Button(exp_side, text="🎬 导出视频…",
+                   command=self._render_project).pack(fill="x", padx=6,
+                                                      pady=(6, 2))
+        self._last_export_path = ""
+        self._last_export_dir = ""
+        self.last_export_var = tk.StringVar(value="导出位置：尚未导出")
+        ttk.Label(exp_side, textvariable=self.last_export_var,
+                  wraplength=310, foreground="#9a9a9a",
+                  justify="left").pack(anchor="w", padx=6, pady=2)
+        ttk.Button(exp_side, text="打开导出文件夹",
+                   command=self._open_last_export_dir).pack(anchor="w",
+                                                            padx=6,
+                                                            pady=(0, 6))
+
+        # ===== 片段属性 =====
+        prop = ttk.LabelFrame(self._side_inner,
+                              text="片段属性（选中片段后修改）")
         self._prop_frame = prop
-        self._prop_visible = False
-        prop.pack(fill="both", expand=True, padx=4, pady=4)
+        prop.pack(fill="x", padx=4, pady=4)
         grid = ttk.Frame(prop)
-        grid.pack(fill="x", padx=8, pady=4)
+        grid.pack(fill="x", padx=6, pady=4)
 
         self.prop_vars = {}
-        fields = [
-            ("in_point", "源起点(秒)"),
-            ("out_point", "源终点(秒)"),
-            ("duration", "时长(秒)"),
-            ("speed", "速度(x)"),
-            ("volume", "音量(x)"),
-            ("fade_in", "淡入(秒)"),
-            ("fade_out", "淡出(秒)"),
-            ("x", "位置 X"),
-            ("y", "位置 Y"),
-            ("w", "宽"),
-            ("h", "高"),
-            ("opacity", "不透明度"),
-            ("ramp_start", "渐变起速(x)"),
-            ("ramp_end", "渐变末速(x)"),
-            ("ramp_dur", "渐变时长(秒)"),
-        ]
-        self.filter_vars = {}
-        for r, (key, label) in enumerate(fields):
-            ttk.Label(grid, text=label + ":").grid(row=r, column=0, sticky="e",
-                                                   padx=2, pady=1)
+
+        def pfield(parent, row, col, label, key, width=6):
+            ttk.Label(parent, text=label).grid(row=row, column=col,
+                                               sticky="e", padx=(2, 1), pady=2)
             var = tk.StringVar(value="")
-            ttk.Entry(grid, textvariable=var, width=8).grid(
-                row=r, column=1, sticky="w", padx=2, pady=1)
+            ttk.Entry(parent, textvariable=var, width=width).grid(
+                row=row, column=col + 1, sticky="w", padx=(0, 8), pady=2)
             self.prop_vars[key] = var
-        # 滤镜行
-        fr = r + 1
-        ttk.Label(grid, text="滤镜:").grid(row=fr, column=0, sticky="e", padx=2)
-        fgrid = ttk.Frame(grid)
-        fgrid.grid(row=fr, column=1, sticky="w", padx=2)
-        for i, (fk, ftxt) in enumerate([("brightness", "亮度"),
-                                        ("contrast", "对比"),
-                                        ("saturation", "饱和")]):
-            ttk.Label(fgrid, text=ftxt).grid(row=0, column=i * 2)
+            return var
+
+        pfield(grid, 0, 0, "源起点(秒)", "in_point")
+        pfield(grid, 0, 2, "源终点(秒)", "out_point")
+        pfield(grid, 1, 0, "时长(秒)", "duration")
+        pfield(grid, 1, 2, "不透明度", "opacity")
+        pfield(grid, 2, 0, "速度(x)", "speed")
+        pfield(grid, 2, 2, "音量(x)", "volume")
+        pfield(grid, 3, 0, "淡入(秒)", "fade_in", 5)
+        pfield(grid, 3, 2, "淡出(秒)", "fade_out", 5)
+        pfield(grid, 4, 0, "渐变起速(x)", "ramp_start", 5)
+        pfield(grid, 4, 2, "渐变末速(x)", "ramp_end", 5)
+        pfield(grid, 5, 0, "渐变时长(秒)", "ramp_dur", 5)
+
+        # 常用速度快捷按钮
+        spd_row = ttk.Frame(grid)
+        spd_row.grid(row=6, column=0, columnspan=4, sticky="w", pady=2)
+        ttk.Label(spd_row, text="快捷速度").pack(side="left")
+        self.spd_btns = []
+        for sp in ("0.5", "0.75", "1", "1.5", "2", "4"):
+            b = ttk.Button(spd_row, text=f"{sp}x", width=3,
+                           command=lambda v=float(sp): self._apply_speed(v))
+            b.pack(side="left", padx=1)
+            self.spd_btns.append(b)
+
+        # 变速到目标时长
+        tgt_row = ttk.Frame(grid)
+        tgt_row.grid(row=7, column=0, columnspan=4, sticky="w", pady=2)
+        ttk.Label(tgt_row, text="变速到目标时长(秒)").pack(side="left")
+        self.target_dur_var = tk.StringVar(value="10")
+        ttk.Entry(tgt_row, textvariable=self.target_dur_var,
+                  width=7).pack(side="left", padx=3)
+        self.btn_target_dur = ttk.Button(tgt_row, text="应用", width=5,
+                                         command=self._apply_target_duration)
+        self.btn_target_dur.pack(side="left")
+
+        # 滤镜
+        f_row = ttk.Frame(grid)
+        f_row.grid(row=8, column=0, columnspan=4, sticky="w", pady=2)
+        ttk.Label(f_row, text="滤镜").pack(side="left")
+        self.filter_vars = {}
+        for fk, ftxt in [("brightness", "亮度"), ("contrast", "对比"),
+                         ("saturation", "饱和")]:
+            ttk.Label(f_row, text=ftxt).pack(side="left", padx=(4, 1))
             var = tk.StringVar(value="1.00")
-            ttk.Entry(fgrid, textvariable=var, width=5).grid(
-                row=0, column=i * 2 + 1, padx=(0, 6))
+            ttk.Entry(f_row, textvariable=var, width=4).pack(side="left")
             self.filter_vars[fk] = var
         self.gray_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(fgrid, text="黑白", variable=self.gray_var).grid(
-            row=0, column=6)
-        # 文字/字幕行（选中 TextClip 时用）
-        txr = fr + 1
-        ttk.Label(grid, text="文字:").grid(row=txr, column=0, sticky="e", padx=2)
-        self.text_vars = {}
-        tvar = tk.StringVar(value="")
-        ttk.Entry(grid, textvariable=tvar, width=26).grid(
-            row=txr, column=1, sticky="w", padx=2)
-        self.text_vars["content"] = tvar
-        ttk.Label(grid, text="字号:").grid(row=txr, column=2, sticky="e", padx=2)
-        fvar = tk.StringVar(value="48")
-        ttk.Entry(grid, textvariable=fvar, width=5).grid(
-            row=txr, column=3, sticky="w")
-        self.text_vars["font_size"] = fvar
-        cvar = tk.StringVar(value="#FFFFFF")
-        ttk.Combobox(grid, textvariable=cvar, state="readonly", width=8,
-                     values=["#FFFFFF 白", "#FFD700 黄", "#FF5555 红",
-                             "#000000 黑", "#55DDFF 青"]) \
-            .grid(row=txr, column=4, sticky="w")
-        self.text_vars["color"] = cvar
-        avar = tk.StringVar(value="bottom")
-        ttk.Combobox(grid, textvariable=avar, state="readonly", width=8,
-                     values=["bottom", "center", "top"]) \
-            .grid(row=txr, column=5, sticky="w")
-        self.text_vars["align"] = avar
+        ttk.Checkbutton(f_row, text="黑白", variable=self.gray_var).pack(
+            side="left", padx=(4, 0))
 
-        # 转场：选择框 + 时长（作用于本片段→下一片段）
-        tr_row = r + 1
-        ttk.Label(grid, text="转场(到下一段):").grid(row=tr_row, column=0,
-                                                     sticky="e", padx=2)
+        # 转场（到下一段）
+        tr_row = ttk.Frame(grid)
+        tr_row.grid(row=9, column=0, columnspan=4, sticky="w", pady=2)
+        ttk.Label(tr_row, text="转场(到下一段)").pack(side="left")
         self.transition_var = tk.StringVar(value="无")
         self.transition_combo = ttk.Combobox(
-            grid, textvariable=self.transition_var, state="readonly", width=10,
-            values=["无"] + TRANSITIONS)
-        self.transition_combo.grid(row=tr_row, column=1, sticky="w", padx=2)
+            tr_row, textvariable=self.transition_var, state="readonly",
+            width=9, values=["无"] + TRANSITIONS)
+        self.transition_combo.pack(side="left", padx=3)
         self.transition_dur_var = tk.StringVar(value="0.5")
-        ttk.Entry(grid, textvariable=self.transition_dur_var, width=6).grid(
-            row=tr_row, column=2, sticky="w", padx=2)
-        ttk.Label(grid, text="秒", foreground="#666").grid(
-            row=tr_row, column=3, sticky="w")
+        ttk.Entry(tr_row, textvariable=self.transition_dur_var,
+                  width=5).pack(side="left")
+        ttk.Label(tr_row, text="秒", foreground="#888").pack(side="left")
 
-        btn_col = ttk.Frame(grid)
-        btn_col.grid(row=0, column=4, rowspan=tr_row + 1, sticky="n", padx=10)
-        self.btn_apply = ttk.Button(btn_col, text="应用修改",
-                                    command=self._apply_props)
-        self.btn_apply.pack(anchor="w", pady=2)
-        self.btn_delete = ttk.Button(btn_col, text="删除片段",
-                                     command=self._delete_selected)
-        self.btn_delete.pack(anchor="w", pady=2)
-        self.btn_ripple = ttk.Button(btn_col, text="波纹删除(闭合接缝)",
-                                     command=self._ripple_delete)
-        self.btn_ripple.pack(anchor="w", pady=2)
-        self.btn_split = ttk.Button(btn_col, text="在播放头分割",
-                                    command=self._split_at_playhead)
-        self.btn_split.pack(anchor="w", pady=2)
-        self.btn_close_gaps = ttk.Button(btn_col, text="闭合本轨空隙",
-                                         command=self._close_gaps)
-        self.btn_close_gaps.pack(anchor="w", pady=2)
-        ttk.Label(btn_col, text="常用速度:",
-                  foreground="#666").pack(anchor="w", pady=(6, 0))
-        spd_row = ttk.Frame(btn_col)
-        spd_row.pack(anchor="w")
-        self.spd_btns = []
-        for s in ("0.5", "0.75", "1", "1.5", "2", "4"):
-            b = ttk.Button(spd_row, text=f"{s}x", width=4,
-                           command=lambda v=float(s): self._apply_speed(v))
-            b.pack(side="left", padx=1, pady=1)
-            self.spd_btns.append(b)
-        ttk.Label(btn_col, text="变速到目标时长(秒):",
-                  foreground="#666").pack(anchor="w", pady=(4, 0))
-        tgt = ttk.Frame(btn_col)
-        tgt.pack(anchor="w")
-        self.target_dur_var = tk.StringVar(value="10")
-        ttk.Entry(tgt, textvariable=self.target_dur_var, width=7).pack(side="left")
-        self.btn_target_dur = ttk.Button(tgt, text="应用", width=5,
-                                         command=self._apply_target_duration)
-        self.btn_target_dur.pack(side="left", padx=2)
-        ttk.Label(btn_col, text="画中画位置预设:",
-                  foreground="#666").pack(anchor="w", pady=(6, 0))
+        # ===== 文字 / 字幕 =====
+        txt_frame = ttk.LabelFrame(self._side_inner, text="文字 / 字幕")
+        txt_frame.pack(fill="x", padx=4, pady=(0, 4))
+        tg = ttk.Frame(txt_frame)
+        tg.pack(fill="x", padx=6, pady=4)
+        ttk.Label(tg, text="内容").grid(row=0, column=0, sticky="e", padx=(2, 1))
+        self.text_vars = {}
+        tvar = tk.StringVar(value="")
+        ttk.Entry(tg, textvariable=tvar, width=22).grid(
+            row=0, column=1, columnspan=4, sticky="we", padx=(0, 6), pady=2)
+        self.text_vars["content"] = tvar
+        ttk.Label(tg, text="字号").grid(row=1, column=0, sticky="e", padx=(2, 1))
+        fvar = tk.StringVar(value="48")
+        ttk.Entry(tg, textvariable=fvar, width=4).grid(
+            row=1, column=1, sticky="w", pady=2)
+        self.text_vars["font_size"] = fvar
+        ttk.Label(tg, text="颜色").grid(row=1, column=2, sticky="e",
+                                        padx=(6, 1))
+        cvar = tk.StringVar(value="#FFFFFF")
+        ttk.Combobox(tg, textvariable=cvar, state="readonly", width=9,
+                     values=["#FFFFFF 白", "#FFD700 黄", "#FF5555 红",
+                             "#000000 黑", "#55DDFF 青"]).grid(
+            row=1, column=3, sticky="w", pady=2)
+        self.text_vars["color"] = cvar
+        ttk.Label(tg, text="对齐").grid(row=1, column=4, sticky="e",
+                                        padx=(6, 1))
+        avar = tk.StringVar(value="bottom")
+        ttk.Combobox(tg, textvariable=avar, state="readonly", width=6,
+                     values=["bottom", "center", "top"]).grid(
+            row=1, column=5, sticky="w", pady=2)
+        self.text_vars["align"] = avar
+
+        # ===== 画中画：大小 / 位置 =====
+        pip_fr = ttk.LabelFrame(self._side_inner, text="画中画：大小 / 位置")
+        pip_fr.pack(fill="x", padx=4, pady=(0, 4))
+        pg = ttk.Frame(pip_fr)
+        pg.pack(fill="x", padx=6, pady=4)
+        for i, (key, label) in enumerate([("x", "位置 X"), ("y", "位置 Y"),
+                                          ("w", "宽"), ("h", "高")]):
+            ttk.Label(pg, text=label).grid(row=i // 2, column=(i % 2) * 2,
+                                           sticky="e", padx=(2, 1), pady=2)
+            var = tk.StringVar(value="")
+            ttk.Entry(pg, textvariable=var, width=7).grid(
+                row=i // 2, column=(i % 2) * 2 + 1, sticky="w",
+                padx=(0, 10), pady=2)
+            self.prop_vars[key] = var
+        ttk.Label(pip_fr, text="位置预设", foreground="#888").pack(
+            anchor="w", padx=6)
+        pos_row = ttk.Frame(pip_fr)
+        pos_row.pack(fill="x", padx=6, pady=(0, 2))
         self.preset_btns = []
         for name in PIP_PRESETS:
-            b = ttk.Button(btn_col, text=name, width=9,
+            b = ttk.Button(pos_row, text=name, width=6,
                            command=lambda n=name: self._apply_preset(n))
-            b.pack(anchor="w", pady=1)
+            b.pack(side="left", padx=1)
             self.preset_btns.append(b)
-        ttk.Button(btn_col, text="撤销", width=9,
-                   command=self._undo).pack(anchor="w", pady=(6, 1))
-        ttk.Button(btn_col, text="重做", width=9,
-                   command=self._redo).pack(anchor="w", pady=1)
+        ttk.Label(pip_fr, text="大小预设（按画面比例，保持源比例）",
+                  foreground="#888").pack(anchor="w", padx=6)
+        size_row = ttk.Frame(pip_fr)
+        size_row.pack(fill="x", padx=6, pady=(0, 6))
+        self.size_btns = []
+        for name, frac in (("原始", 1.0), ("3/4", 0.75), ("1/2", 0.5),
+                           ("1/3", 1 / 3), ("1/4", 0.25)):
+            b = ttk.Button(size_row, text=name, width=5,
+                           command=lambda f=frac: self._apply_pip_scale(f))
+            b.pack(side="left", padx=1)
+            self.size_btns.append(b)
 
-        # ---- 属性面板是独立浮动窗（已 withdraw），不占主布局 ----
+        # ===== 操作 =====
+        act = ttk.LabelFrame(self._side_inner, text="操作")
+        act.pack(fill="x", padx=4, pady=(0, 4))
+        ag = ttk.Frame(act)
+        ag.pack(fill="x", padx=6, pady=4)
+        self.btn_apply = ttk.Button(ag, text="✔ 应用修改",
+                                    command=self._apply_props)
+        self.btn_apply.pack(fill="x", pady=2)
+        self.btn_delete = ttk.Button(ag, text="删除片段",
+                                     command=self._delete_selected)
+        self.btn_delete.pack(fill="x", pady=2)
+        self.btn_ripple = ttk.Button(ag, text="波纹删除（闭合接缝）",
+                                     command=self._ripple_delete)
+        self.btn_ripple.pack(fill="x", pady=2)
+        self.btn_split = ttk.Button(ag, text="在播放头分割",
+                                    command=self._split_at_playhead)
+        self.btn_split.pack(fill="x", pady=2)
+        self.btn_close_gaps = ttk.Button(ag, text="闭合本轨空隙",
+                                         command=self._close_gaps)
+        self.btn_close_gaps.pack(fill="x", pady=2)
+        ur = ttk.Frame(ag)
+        ur.pack(fill="x", pady=(6, 2))
+        ttk.Button(ur, text="↩ 撤销", command=self._undo).pack(
+            side="left", expand=True, fill="x", padx=(0, 2))
+        ttk.Button(ur, text="↪ 重做", command=self._redo).pack(
+            side="left", expand=True, fill="x", padx=(2, 0))
 
         # ---- 导出（进度与状态常驻，按钮在工具栏） ----
         self._exp_frame = ttk.Frame(right)
@@ -434,7 +566,7 @@ class EditorApp:
         ttk.Label(exp, text="导出进度:").pack(side="left")
         self.render_progress = ttk.Progressbar(exp, mode="determinate")
         self.render_progress.pack(side="left", fill="x", expand=True, padx=8)
-        self.status_var = tk.StringVar(value="就绪")
+        self.status_var = tk.StringVar(value="就绪 · 导出点右侧「🎬 导出视频」")
         ttk.Label(exp, textvariable=self.status_var,
                   foreground="#888").pack(side="left")
 
@@ -470,11 +602,13 @@ class EditorApp:
         self.timeline.on_select = self._on_clip_selected
         self.timeline.on_open = self._preview_clip
         self.timeline.on_seek = self._on_timeline_seek
-        self.timeline.on_clips_changed = self._after_model_change
+        self.timeline.on_clips_changed = self._on_clips_changed_light
+        self.timeline.on_edit_commit = self._commit_timeline_edit
         self.timeline.on_drag_start = self._push_undo
         self.timeline.get_wave = lambda path: self.wave_peaks.get(path)
         self.timeline.on_rightclick = self._timeline_context_menu
         self.timeline.on_release = self._flush_seek
+        self.timeline.on_move_track = self._timeline_drop_track
 
     # ================================================================ 状态记忆
     def _restore_state(self):
@@ -518,21 +652,89 @@ class EditorApp:
         log.info("已记忆界面状态")
 
     def prop_frame_recover(self):
-        """切换属性浮动窗显隐。"""
-        self._prop_visible = not self._prop_visible
-        if self._prop_visible:
+        """显示 / 隐藏右侧属性侧栏。"""
+        try:
+            if self._prop_visible:
+                self.main_paned.forget(self.side)
+                self._prop_visible = False
+            else:
+                self.main_paned.add(self.side, weight=0)
+                self._prop_visible = True
+        except Exception as e:
+            log.debug("切换侧栏失败: %s", e)
+
+    def _side_scroll_wheel(self, evt):
+        """鼠标在侧栏上时滚轮滚动侧栏（不影响其它区域）。"""
+        try:
+            w = self._side_canvas.winfo_containing(evt.x_root, evt.y_root)
+            node = w
+            while node is not None and node is not self._side_canvas:
+                node = getattr(node, "master", None)
+            if node is None:
+                return
+            self._side_canvas.yview_scroll(-1 if evt.delta > 0 else 1, "units")
+        except Exception:
+            pass
+
+    def _open_last_export_dir(self):
+        """打开最近一次导出所在文件夹。"""
+        p = getattr(self, "_last_export_path", "")
+        d = os.path.dirname(p) if p else getattr(self, "_last_export_dir", "")
+        if d and os.path.isdir(d):
             try:
-                self.prop_win.deiconify()
-                self.prop_win.lift()
+                os.startfile(d)
+            except Exception as e:
+                messagebox.showerror("错误", f"打不开文件夹：{e}")
+        else:
+            messagebox.showinfo("提示", "还没有导出过成片。\n"
+                                "点「🎬 导出视频…」即可导出到素材文件夹。")
+
+    def _mark_exported(self, path: str):
+        """记录最近一次导出，侧栏显示成片位置。"""
+        self._last_export_path = path
+        self._last_export_dir = os.path.dirname(path)
+        try:
+            self.last_export_var.set("最近导出：\n" + path)
+        except Exception:
+            pass
+
+    def _apply_pip_scale(self, frac: float):
+        """画中画大小预设：缩到画面的 frac 倍（保持源比例，不越界）。"""
+        clip = self.project.find_clip(self.timeline.selected_id or "")
+        if clip is None or isinstance(clip, TextClip):
+            messagebox.showwarning("提示", "请先选中一个视频或图片片段。")
+            return
+        if isinstance(clip, VideoClip) and self._is_main_clip(clip):
+            messagebox.showinfo("提示",
+                                "主轨片段总是满屏；请把视频加到画中画轨再改大小。")
+            return
+        W, H = self.project.canvas_w, self.project.canvas_h
+        self._push_undo()
+        if frac >= 1.0:
+            clip.x, clip.y, clip.w, clip.h = 0, 0, W, H
+        else:
+            sw, sh = W, H
+            try:
+                meta = self.engine._probe_info(clip.src)
+                sw = int(meta.get("width", 0) or W) or W
+                sh = int(meta.get("height", 0) or H) or H
             except Exception:
                 pass
-        else:
-            self.prop_win.withdraw()
-
-    def _prop_win_close(self):
-        """点属性窗 X：隐藏而非销毁。"""
-        self._prop_visible = False
-        self.prop_win.withdraw()
+            w = W * frac
+            h = w * sh / max(sw, 1)
+            x = float(getattr(clip, "x", -1))
+            y = float(getattr(clip, "y", -1))
+            if x < 0 or y < 0:
+                x, y = (W - w) / 2.0, (H - h) / 2.0
+            x = min(max(x, 0.0), max(W - w, 0.0))
+            y = min(max(y, 0.0), max(H - h, 0.0))
+            clip.x, clip.y, clip.w, clip.h = x, y, w, h
+        self._fill_props(clip)
+        self._after_model_change()
+        self._preview_clip(clip)
+        self.status_var.set(
+            f"画中画大小 {frac:.0%}：{clip.w:.0f}×{clip.h:.0f} 像素"
+            f"（位置 {clip.x:.0f},{clip.y:.0f}）")
 
     # ============ 媒体 ============
     def _browse_dir(self):
@@ -580,16 +782,16 @@ class EditorApp:
 
     _thumb_done = {"n": 0, "total": 0}
 
-    def _on_thumb_ready(self, path: str, im):
-        """缩略图生成完成 → 更新对应行图标（后台线程回调，须回 UI 线程处理）。"""
+    def _thumb_ready_refresh(self, path: str, im):
+        """（后台线程回调）→ 排到 UI 线程处理，防止 Tk 跨线程报错。"""
+        self._post_ui(lambda: self._thumb_apply(path, im))
+
+    def _thumb_apply(self, path: str, im):
+        """（UI 线程）缩略图上屏 + 节流刷新时间轴。"""
         try:
-            c = self._thumb_done
-            c["n"] += 1
-            done = c["n"] >= (c["total"] or c["n"])
-            if done:
-                self._idle(f"就绪（{len(self.media_files)} 个素材）")
-                self.thumbs.on_ready = self._on_thumb_ready_plain
             from PIL import ImageTk
+            if im.size != (96, 54):
+                im = im.resize((96, 54), _PILImage.LANCZOS)
             photo = ImageTk.PhotoImage(im)
             self.thumb_photos[path] = photo
             p = path.lower()
@@ -599,27 +801,40 @@ class EditorApp:
                     if self.media_list.exists(iid):
                         self.media_list.item(iid, image=photo)
                     break
+            if not getattr(self, "_thumb_refresh_pending", False):
+                self._thumb_refresh_pending = True
+
+                def _later():
+                    self._thumb_refresh_pending = False
+                    try:
+                        self.timeline.refresh()
+                    except Exception:
+                        pass
+                self.root.after(120, _later)
         except Exception as e:
             log.warning("缩略图上屏失败: %s", e)
+
+    def _on_thumb_ready(self, path: str, im):
+        """计数版：全部就绪后转普通回调；周转 UI 线程上屏。"""
+        c = self._thumb_done
+        c["n"] += 1
+        done = c["n"] >= (c["total"] or c["n"])
+        if done:
+            self.thumbs.on_ready = self._on_thumb_ready_plain
+        self._thumb_ready_refresh(path, im)
+        if done:
+            self._post_ui(lambda: self._idle(
+                f"就绪（{len(self.media_files)} 个素材）"))
 
     def _on_thumb_ready_plain(self, path: str, im):
-        """缩略图全部就绪后的兜底回调（不再计数）。"""
-        try:
-            from PIL import ImageTk
-            photo = ImageTk.PhotoImage(im)
-            self.thumb_photos[path] = photo
-            p = path.lower()
-            for i, (_tag, full) in enumerate(self.media_files):
-                if full.lower() == p:
-                    iid = str(i)
-                    if self.media_list.exists(iid):
-                        self.media_list.item(iid, image=photo)
-                    break
-        except Exception as e:
-            log.warning("缩略图上屏失败: %s", e)
+        """普通回调：周转 UI 线程上屏。"""
+        self._thumb_ready_refresh(path, im)
 
     def _on_wave_ready(self, path: str, peaks):
-        """波形计算完成 → 存缓存并刷新时间轴。"""
+        """（后台线程）波形就绪 → 排到 UI 线程刷新。"""
+        self._post_ui(lambda: self._wave_apply(path, peaks))
+
+    def _wave_apply(self, path: str, peaks):
         self.wave_peaks[path] = peaks
         try:
             self.timeline.refresh()
@@ -655,21 +870,30 @@ class EditorApp:
         path = self._selected_media()
         if not path:
             return
-        self._add_media_path_main(path)
+        if self._media_kind(path) != "video":
+            messagebox.showwarning(
+                "提示", "只有视频能进主轨（图片→画中画，音频→音频轨）。")
+            return
+        self._probe_then(path, "读取视频信息",
+                         lambda span: self._do_add_path_main(path, span))
 
-    def _add_media_path_main(self, path: str, notify: bool = True):
-        """把视频顺序加到主轨末尾；带状态反馈与自动滚动到新片段。"""
-        kind = self._media_kind(path)
-        if kind != "video":
-            if notify:
-                messagebox.showwarning(
-                    "提示", "只有视频能进主轨（图片→画中画，音频→音频轨）。")
+    def _probe_then(self, path: str, label: str, on_ready):
+        """后台探测时长后回调 on_ready(span)（保持 UI 不冻结）。"""
+        self._start_task(
+            label, lambda: self.engine.source_length(path),
+            lambda span: (
+                on_ready(span) if span and span > 0
+                else messagebox.showerror(
+                    "错误", "无法读取媒体时长，文件可能有损坏。")),
+            block=True)
+
+    def _do_add_path_main(self, path: str, src_len: float):
+        """主轨添加的收尾（已在 UI 线程，时长由后台提前探测）。"""
+        now = _time_now.time()
+        last = getattr(self, "_last_add", (None, 0.0))
+        if last[0] == path and now - last[1] < 0.35:
             return
-        src_len = self.engine.source_length(path)
-        if src_len <= 0:
-            if notify:
-                messagebox.showerror("错误", "无法读取视频时长，文件可能有损坏。")
-            return
+        self._last_add = (path, now)
         self._push_undo()
         track = self.project.track("main", create=True)
         clip = VideoClip(src=path, ts=track.end_time(),
@@ -699,30 +923,34 @@ class EditorApp:
         if kind == "audio":
             messagebox.showwarning("提示", "音频请加到音频轨。")
             return
+        if kind == "image":
+            self._do_add_pip(path, 0.0)
+            return
+        self._probe_then(path, "读取视频信息",
+                         lambda span: self._do_add_pip(path, span))
+
+    def _do_add_pip(self, path: str, src_len: float):
+        kind = self._media_kind(path)
         self._push_undo()
         W, H = self.project.canvas_w, self.project.canvas_h
         track = self._overlay_track_append()
         ts0 = round(track.end_time(), 3)
         if kind == "image":
             clip = ImageClip(
-                src=path, ts=0,
+                src=path, ts=ts0,
                 duration=max(self.project.total_duration(), 10),
                 x=W * 0.64, y=H * 0.64, w=W * 0.34, h=H * 0.19,
                 opacity=1.0)
-            track.add(clip)
         else:
-            src_len = self.engine.source_length(path)
-            if src_len <= 0:
-                messagebox.showerror("错误", "无法读取视频时长，文件可能有损坏。")
-                return
             clip = VideoClip(src=path, ts=ts0, duration=round(src_len, 3),
                              in_point=0, out_point=round(src_len, 3),
                              x=W * 0.64, y=H * 0.02, w=W * 0.34, h=H * 0.28)
-            track.add(clip)
+        track.add(clip)
         log.info("画中画轨追加片段(ts=%.2f): %s", ts0, path)
         self._after_model_change()
         self.timeline.select(clip.id)
-        self.status_var.set(f"✅ 已插入画中画（选中后可改位置/尺寸）：{os.path.basename(path)}")
+        self.status_var.set(
+            f"✅ 已插入画中画（选中后可改位置/尺寸）：{os.path.basename(path)}")
 
     def _media_add_full(self, _evt=None):
         """加到全屏轨：满屏、顺序拼接，相当于第二条主轨。"""
@@ -732,10 +960,10 @@ class EditorApp:
         if self._media_kind(path) != "video":
             messagebox.showwarning("提示", "只有视频能加到全屏轨。")
             return
-        src_len = self.engine.source_length(path)
-        if src_len <= 0:
-            messagebox.showerror("错误", "无法读取视频时长，文件可能有损坏。")
-            return
+        self._probe_then(path, "读取视频信息",
+                         lambda span: self._do_add_full(path, span))
+
+    def _do_add_full(self, path: str, src_len: float):
         self._push_undo()
         W, H = self.project.canvas_w, self.project.canvas_h
         track = self.project.new_overlay_track()
@@ -746,6 +974,7 @@ class EditorApp:
         log.info("全屏轨添加片段: %s", path)
         self._after_model_change()
         self.timeline.select(clip.id)
+        self.status_var.set(f"✅ 已加入全屏轨：{os.path.basename(path)}")
 
     def _media_add_audio(self, _evt=None):
         path = self._selected_media()
@@ -754,10 +983,10 @@ class EditorApp:
         if self._media_kind(path) != "audio":
             messagebox.showwarning("提示", "只有音频文件（mp3/wav/aac 等）能进音频轨。")
             return
-        src_len = self.engine.source_length(path)
-        if src_len <= 0:
-            messagebox.showerror("错误", "无法读取音频时长，文件可能有损坏。")
-            return
+        self._probe_then(path, "读取音频信息",
+                         lambda span: self._do_add_audio(path, span))
+
+    def _do_add_audio(self, path: str, src_len: float):
         self._push_undo()
         track = self.project.new_audio_track()
         clip = AudioClip(src=path, ts=0, duration=round(src_len, 3),
@@ -767,7 +996,8 @@ class EditorApp:
         log.info("音频轨添加片段: %s", path)
         self._after_model_change()
         self.timeline.select(clip.id)
-        self.status_var.set(f"✅ 已插入音频轨：{os.path.basename(path)}，可拖边缘裁剪")
+        self.status_var.set(
+            f"✅ 已插入音频轨：{os.path.basename(path)}，可拖边缘裁剪")
 
     # ============ 拖拽加入时间轴 ============
     def _media_drag_press(self, evt):
@@ -779,14 +1009,79 @@ class EditorApp:
         else:
             self._media_drag_path = None
 
+    # ---------- 拖拽幽灵（缩略图跟随光标）+ 落点提示 ----------
+    def _media_drag_motion(self, evt):
+        path = getattr(self, "_media_drag_path", None)
+        if not path:
+            return
+        sx, sy = getattr(self, "_drag_xy", (evt.x, evt.y))
+        if abs(evt.x - sx) < 12 and abs(evt.y - sy) < 12:
+            return   # 还没算开始拖
+        self._drag_ghost_show(path, evt.x_root, evt.y_root)
+        # 落点提示：指针是否在时间轴上
+        node = self.root.winfo_containing(evt.x_root, evt.y_root)
+        while node is not None and node is not self.timeline:
+            node = node.master if node.master else None
+        if node is self.timeline:
+            x_px = evt.x_root - self.timeline.winfo_rootx()
+            self.timeline.set_drop_hint(self.timeline.time_at_x(x_px))
+        else:
+            self.timeline.clear_drop_hint()
+
+    def _drag_ghost_show(self, path: str, x_root: int, y_root: int):
+        try:
+            if self._drag_ghost is None:
+                top = tk.Toplevel(self.root)
+                top.wm_overrideredirect(True)
+                try:
+                    top.wm_attributes("-topmost", True)
+                except Exception:
+                    pass
+                frame = tk.Frame(top, bg="#252526",
+                                 highlightthickness=1,
+                                 highlightbackground="#4a9eff")
+                frame.pack()
+                img_lbl = tk.Label(frame, bg="#252526")
+                img_lbl.pack()
+                txt = tk.Label(frame, text=os.path.basename(path),
+                               bg="#252526", fg="#e0e0e0",
+                               font=("Microsoft YaHei UI", 9))
+                txt.pack(padx=4, pady=(0, 3))
+                self._drag_ghost = top
+                self._drag_ghost_img, self._drag_ghost_txt = img_lbl, txt
+            ph = self.thumb_photos.get(path)
+            if ph is not None and ph is not self._drag_ghost_photo:
+                self._drag_ghost_photo = ph
+                self._drag_ghost_img.config(image=ph)
+            self._drag_ghost_txt.config(text=os.path.basename(path))
+            # 偏移一点，避免幽灵窗口夺走鼠标事件
+            self._drag_ghost.geometry(f"+{x_root + 18}+{y_root + 12}")
+        except Exception as e:
+            log.debug("拖拽幽灵失败: %s", e)
+
+    def _drag_ghost_hide(self):
+        try:
+            if self._drag_ghost is not None:
+                self._drag_ghost.destroy()
+        except Exception:
+            pass
+        self._drag_ghost = None
+        self._drag_ghost_photo = None
+
     def _media_drag_release(self, evt):
         path = getattr(self, "_media_drag_path", None)
         self._media_drag_path = None
+        self._drag_ghost_hide()
+        try:
+            self.timeline.clear_drop_hint()
+        except Exception:
+            pass
         if not path:
             return
-        # 移动过小视为单击/双击，不当作拖拽
+        # 必须是真正的拖拽（≥12px），且落点必须在时间轴内——
+        # 否则双击时的手抖会被误判成拖拽，导致"加了两次"
         sx, sy = getattr(self, "_drag_xy", (0, 0))
-        if abs(evt.x - sx) < 8 and abs(evt.y - sy) < 8:
+        if abs(evt.x - sx) < 12 and abs(evt.y - sy) < 12:
             return
         # 检查指针是否落在时间轴上
         widget = self.root.winfo_containing(evt.x_root, evt.y_root)
@@ -794,8 +1089,8 @@ class EditorApp:
         while node is not None and node != self.timeline:
             node = node.master if node.master else None
         if node is None:
-            # 落空：兜底加到主轨末尾（绝不静默失败）
-            self._add_media_path_main(path, notify=False)
+            # 落点在时间轴之外：不加入（避免误触重复添加）
+            self.status_var.set("拖到时间轴区域松手才会加入素材")
             return
         x_px = evt.x_root - self.timeline.winfo_rootx()
         y_px = evt.y_root - self.timeline.winfo_rooty()
@@ -805,30 +1100,33 @@ class EditorApp:
     def _drop_media(self, path: str, sec: float, y_px: float):
         """拖拽落点：视频→顺序跟主轨末尾；图片→画中画；音频→音频轨。"""
         kind = self._media_kind(path)
+        if kind == "image":
+            self._do_drop(path, sec, 0.0)
+            return
+        self._probe_then(path, "读取媒体信息",
+                         lambda span: self._do_drop(path, sec, span))
+
+    def _do_drop(self, path: str, sec: float, span: float):
+        kind = self._media_kind(path)
         W, H = self.project.canvas_w, self.project.canvas_h
         self._push_undo()
         if kind == "video":
-            # 视频永远跟在主轨后面（顺序拼接，这就是直觉）
             track = self.project.track("main", create=True)
-            span = self.engine.source_length(path)
             clip = VideoClip(src=path, ts=max(sec, track.end_time()),
                              duration=round(span, 3),
                              in_point=0, out_point=round(span, 3))
-            track.add(clip)
         elif kind == "image":
             track = self._overlay_track_append()
             clip = ImageClip(src=path, ts=max(sec, track.end_time()),
                              duration=max(self.project.total_duration(), 10),
                              x=W * 0.64, y=H * 0.64, w=W * 0.34,
                              h=H * 0.19, opacity=1.0)
-            track.add(clip)
         else:
             track = self.project.new_audio_track()
-            span = self.engine.source_length(path)
             clip = AudioClip(src=path, ts=max(sec, track.end_time()),
                              duration=round(span, 3),
                              in_point=0, out_point=round(span, 3))
-            track.add(clip)
+        track.add(clip)
         log.info("拖拽加入 %s -> %s @ %.2fs", os.path.basename(path),
                  track.kind, clip.ts)
         self._after_model_change()
@@ -970,6 +1268,23 @@ class EditorApp:
             f"已恢复（片段 {len(project.all_clips())}，总长 {self._fmt(project.total_duration())}）")
 
     # ================================================================ 时间轴联动
+    def _on_clips_changed_light(self):
+        """拖动过程中的轻量回调：只报状态，不做 autosave/控件/重绘风暴。"""
+        try:
+            self.status_var.set(
+                f"拖动中… 总时长 {self._fmt(self.project.total_duration())}")
+        except Exception:
+            pass
+
+    def _commit_timeline_edit(self):
+        """拖动松手：一次性提交（自动保存 + 控件状态 + 完整刷新）。"""
+        self.store.request_autosave(self.project, self.base_dir)
+        self.timeline.refresh()
+        self._refresh_controls()
+        self.status_var.set(
+            f"✅ 已更新｜总时长 {self._fmt(self.project.total_duration())}"
+            f"｜片段 {len(self.project.all_clips())}")
+
     def _after_model_change(self):
         self.store.request_autosave(self.project, self.base_dir)
         self.timeline.refresh()
@@ -990,13 +1305,16 @@ class EditorApp:
         return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
     def _reveal_clip(self, clip):
-        """拼完后的视图策略：
-        总片长短（可整条放下）→ 自动适配，亲眼看到时间轴变长；
-        总片长长 → 保持缩放、滚到新片段，避免整条被压成蚂蚁线。
-        """
+        """拼完后的视图策略：长视频按比例缩放（一眼看全，刻度自适应），
+        短视频保持合适缩放并滚到新片段。"""
         try:
             w = self.timeline.winfo_width()
             if w <= 50:
+                return
+            # 整条时间轴在当前缩放下超过约 3 屏 → 等比缩放回一屏（长视频不铺成超长条）
+            if self.timeline.content_width() > w * 3:
+                self.timeline.fit()
+                self.timeline.see_playhead()
                 return
             total = self.project.total_duration()
             if total * 4 <= w:
@@ -1027,6 +1345,7 @@ class EditorApp:
         m["out_point"].set(fmt1(clip.out_point))
         m["duration"].set(fmt1(clip.duration))
         m["speed"].set(fmt1(clip.speed))
+        m["volume"].set(fmt1(getattr(clip, "volume", 1.0)))
         m["fade_in"].set(fmt1(getattr(clip, "fade_in", 0.0)))
         m["fade_out"].set(fmt1(getattr(clip, "fade_out", 0.0)))
         m["x"].set(fmt1(getattr(clip, "x", -1)))
@@ -1139,7 +1458,8 @@ class EditorApp:
         log.info("应用属性: id=%s speed=%s vol=%s", clip.id, clip.speed, clip.volume)
         self._after_model_change()
         self._preview_clip(clip)
-
+        self.status_var.set("✔ 已应用修改（点 ▶ 或 ⟳ 预览看效果）")
+        # 预览不打扰：需要看新效果请点 ▶ 或 ⟳ 预览刷新
     def _apply_preset(self, name: str):
         clip = self.project.find_clip(self.timeline.selected_id or "")
         if clip is None:
@@ -1303,21 +1623,29 @@ class EditorApp:
         log.info("重置片段速度为常速: %s", clip.id)
 
     def _timeline_speed(self, factor: float):
-        clip = self.project.find_clip(self.timeline.selected_id or "")
-        if clip is None or isinstance(clip, (ImageClip, TextClip)):
-            return
+        """对选中片段（支持多选）统一变速。"""
+        ids = self.timeline.selected_ids()
         self._push_undo()
-        clip.speed = round(max(clip.speed * factor, 0.1), 3)
-        if hasattr(clip, "ramp_start"):
-            clip.ramp_start = clip.ramp_end = clip.ramp_dur = 0.0
-        clip.duration = round(self._src_span(clip) / clip.speed, 3)
-        self._fill_props(clip)
+        done = 0
+        for cid in ids:
+            clip = self.project.find_clip(cid)
+            if clip is None or isinstance(clip, (ImageClip, TextClip)):
+                continue
+            spd = max(factor, 0.1)
+            clip.speed = spd
+            if hasattr(clip, "ramp_start"):
+                clip.ramp_start = clip.ramp_end = clip.ramp_dur = 0.0
+            span = self._src_span(clip)
+            if span > 0:
+                clip.duration = round(span / spd, 3)
+            done += 1
+        self._fill_props(self.project.find_clip(self.timeline.selected_id or ""))
         self._after_model_change()
-        log.info("时间轴右键变速: %.3fx", clip.speed)
+        log.info("批量变速 %d 个片段 x%.3f", done, factor)
 
-    def _load_clip_preview(self, clip, autoplay: bool = True):
-        """加载片段到预览（记录时间轴偏移）。autoplay=False 仅定位不播。"""
-        self._busy("正在打开预览… 解码画面/声音")
+    def _load_clip_preview(self, clip, autoplay: bool = True,
+                           seek_after: float | None = None):
+        """加载片段到预览。重活（探测元数据）在后台线程，UI 不冻结。"""
         if isinstance(clip, TextClip):
             self.player.pause()
             self.player.draw_text_center(
@@ -1331,15 +1659,32 @@ class EditorApp:
         src_len = (clip.out_point - clip.in_point) / spd
         if src_len <= 0:
             return
+        base = os.path.basename(clip.src)
+        self._start_task(
+            f"打开预览：{base}",
+            lambda: self.engine.source_meta(clip.src),
+            lambda meta: self._do_player_load(clip, spd, src_len, meta,
+                                              autoplay, seek_after),
+            block=True)
+
+    def _do_player_load(self, clip, spd, src_len, meta, autoplay,
+                        seek_after):
+        """（UI 线程）用后台拿到的元数据装载播放器并定位。"""
         self.player.load(clip.src, clip.in_point, src_len, spd, 960, 540,
                          audio_src=clip.src, audio_in=clip.in_point,
                          audio_len=(clip.out_point - clip.in_point),
-                         audio_vol=clip.volume)
+                         audio_vol=clip.volume,
+                         src_w=int(meta.get("width", 0) or 0),
+                         src_h=int(meta.get("height", 0) or 0),
+                         fps=float(meta.get("fps", 0) or 0))
         self._preview_clip_id = clip.id
         self._preview_ts = clip.ts
+        if seek_after is not None:
+            self.player.seek(seek_after)
         if autoplay:
             self.player.play()
         self._refresh_controls()
+        self._idle("预览就绪")
 
     def _advance_timeline(self):
         """时间轴模式下播完一段自动接下一段（主轨顺序）。"""
@@ -1362,22 +1707,66 @@ class EditorApp:
                                    drive_timeline=False)
 
     def _timeline_thumb(self, path: str):
-        """时间轴片段迷你缩略图（同步取缓存，防 GC）。"""
-        try:
-            ph = self.thumb_photos.get(path)
-            if ph is not None:
-                return ph
-            kind = self._thumb_kind.get(path, 'video')
-            from PIL import ImageTk
-            im = self.thumbs.generate(path, kind)
-            if im is None:
-                return None
-            im.thumbnail((64, 34))
-            ph = ImageTk.PhotoImage(im)
-            self.thumb_photos[path] = ph
+        """时间轴片段迷你缩略图：只取缓存，未就绪则后台生成（不阻塞）。"""
+        ph = self.thumb_photos.get(path)
+        if ph is not None:
             return ph
-        except Exception:
-            return None
+        # 后台排队生成；完成后 _on_thumb_ready 会刷新时间轴
+        self.thumbs.request(path, self._thumb_kind.get(path, "video"))
+        return None
+
+    def _preview_refresh(self):
+        """⟳：手动刷新预览（默认编辑不打扰预览）。"""
+        clip = self.project.find_clip(self.timeline.selected_id or "")
+        if clip is None:
+            self._play_timeline()
+            return
+        self._preview_clip(clip)
+
+    def _timeline_drop_track(self, clip, row_kind: str):
+        """跨轨拖拽落点：按目标轨类型移动片段。"""
+        if isinstance(clip, VideoClip) and row_kind in ("main", "overlay",
+                                                        "subtitle"):
+            self._convert_track(clip, to_main=(row_kind == "main"))
+            return
+        log.info("跨轨拖拽 -> %s", row_kind)
+
+    def _convert_track(self, clip, to_main: bool):
+        """跨轨转换：主轨↔画中画。"""
+        if not isinstance(clip, VideoClip):
+            messagebox.showwarning("提示", "只有视频能跨轨转换。")
+            return
+        src_track = self._track_of(clip)
+        if src_track is None:
+            return
+        self._push_undo()
+        src_track.clips.remove(clip)
+        if to_main:
+            mt = self.project.track("main", create=True)
+            clip.x = clip.y = clip.w = clip.h = -1
+            clip.ts = max(clip.ts, mt.end_time())
+            mt.add(clip)
+        else:
+            W, H = self.project.canvas_w, self.project.canvas_h
+            clip.x, clip.y = W * 0.64, H * 0.02
+            clip.w, clip.h = W * 0.34, H * 0.28
+            ov = self._overlay_track_append()
+            clip.ts = max(clip.ts, ov.end_time())
+            ov.add(clip)
+        self._after_model_change()
+        self.timeline.select(clip.id)
+        log.info("跨轨转换 -> %s", "主轨" if to_main else "画中画")
+
+    def _cycle_selection(self, delta: int):
+        """↑/↓ 在主轨片段间切换选中。"""
+        mt = self.project.track("main", create=False)
+        if not mt or not mt.clips:
+            return
+        ids = [c.id for c in sorted(mt.clips, key=lambda c: c.ts)]
+        cur = self.timeline.selected_id
+        idx = ids.index(cur) if cur in ids else -1
+        nxt = ids[(idx + (1 if delta > 0 else -1)) % len(ids)]
+        self.timeline.select(nxt)
 
     # ============ 复制 / 粘贴 ============
     def _copy_clip(self):
@@ -1457,9 +1846,155 @@ class EditorApp:
             pass
 
     # ============ 忙碌指示（让用户知道软件在干嘛） ============
+    # ============ 任务系统（后台线程 + 忙碌遮罩） ============
+    def _post_ui(self, fn):
+        """后台线程安全地把回调排到 UI 线程（主循环 drain）。"""
+        try:
+            self.ui_q.put(fn)
+        except Exception:
+            pass
+
+    def _drain_ui_q(self):
+        while True:
+            try:
+                fn = self.ui_q.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                fn()
+            except Exception as e:  # noqa: BLE001
+                log.warning("UI 任务执行失败: %s", e)
+
+    def _start_task(self, name, fn, on_done=None, on_error=None,
+                    block: bool = True):
+        """把重活丢后台线程；期间显示中央遮罩并吞掉点击。
+        background_tasks=False 时同步执行（供自动化测试）。"""
+        if self._task_busy:
+            try:
+                self.status_var.set(f"⏳ 正在处理「{self._task_name}」，请稍候…")
+            except Exception:
+                pass
+            return False
+
+        if not self.background_tasks:
+            try:
+                result = fn()
+            except Exception as e:
+                log.exception("任务失败: %s", name)
+                if on_error:
+                    on_error(e)
+                elif block:
+                    messagebox.showerror("出错", f"{name} 失败：{e}")
+                return True
+            if on_done:
+                on_done(result)
+            return True
+
+        self._task_busy = True
+        self._task_name = name
+        if block:
+            self._show_busy_overlay(name)
+        else:
+            self._busy(name + "…", indeterminate=True)
+
+        def worker():
+            result, err = None, None
+            try:
+                result = fn()
+            except Exception as e:  # noqa: BLE001
+                err = e
+            # 线程安全：排到 UI 队列，由主循环 drain 执行（不能跨线程调 Tk）
+            self._post_ui(lambda: self._finish_task(name, result, err,
+                                                    on_done, on_error, block))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def _finish_task(self, name, result, err, on_done, on_error, block):
+        self._task_busy = False
+        if block:
+            self._hide_busy_overlay()
+        else:
+            self._idle("就绪")
+        if err is not None:
+            log.exception("任务失败: %s", name)
+            if on_error:
+                on_error(err)
+            else:
+                messagebox.showerror("出错", f"{name} 失败：{err}")
+            return
+        if on_done:
+            try:
+                on_done(result)
+            except Exception as e:  # noqa: BLE001
+                log.exception("任务收尾失败: %s", name)
+                messagebox.showerror("出错", f"{name} 处理结果失败：{e}")
+
+    def _wait_idle(self, timeout: float = 30.0):
+        """（测试用）泵事件循环直到没有后台任务。"""
+        t0 = _time_now.time()
+        while self._task_busy and _time_now.time() - t0 < timeout:
+            try:
+                self.root.update()
+            except Exception:
+                break
+            _time_now.sleep(0.01)
+        return not self._task_busy
+
+    # ---------- 中央忙碌遮罩（吞点击，避免越点越卡） ----------
+    def _show_busy_overlay(self, name: str):
+        try:
+            if self._busy_mask is not None:
+                self._busy_mask.lift()
+                return
+            mask = tk.Frame(self.root, bg="#0d0d0d")
+            mask.place(relx=0, rely=0, relwidth=1, relheight=1)
+            card = tk.Frame(mask, bg="#252526", highlightthickness=1,
+                            highlightbackground="#4a9eff")
+            card.place(relx=0.5, rely=0.5, anchor="center")
+            lbl = tk.Label(card, text="", bg="#252526", fg="#e0e0e0",
+                           font=("Microsoft YaHei UI", 12), padx=34, pady=22,
+                           justify="center")
+            lbl.pack()
+            for w in (mask, card, lbl):
+                w.bind("<Button-1>", lambda e: "break")
+            self._busy_mask, self._busy_lbl = mask, lbl
+            self._busy_t0 = _time_now.time()
+            self._tick_busy_overlay()
+        except Exception as e:
+            log.warning("忙碌遮罩创建失败: %s", e)
+
+    def _tick_busy_overlay(self):
+        if self._busy_mask is None:
+            return
+        try:
+            el = int(_time_now.time() - getattr(self, "_busy_t0",
+                                                _time_now.time()))
+            self._busy_lbl.config(
+                text="⏳ 正在" + self._task_name + "\n已等待 "
+                     + str(el) + "s\n（处理中，请稍候…）")
+        except Exception:
+            pass
+        self.root.after(300, self._tick_busy_overlay)
+
+    def _hide_busy_overlay(self):
+        try:
+            if self._busy_mask is not None:
+                self._busy_mask.destroy()
+        except Exception:
+            pass
+        self._busy_mask, self._busy_lbl = None, None
+
     def _busy(self, text: str, indeterminate: bool = True):
-        """状态栏+进度条转圈提示。渲染中请用 0~100 的确定模式。"""
-        self.status_var.set("⏳ " + text)
+        """状态栏+进度条转圈提示；同时标题加 ⏳（一眼看出在忙）。"""
+        self._busy_t0 = getattr(self, "_busy_t0", _time_now.time())
+        if not getattr(self, "_title_base", None):
+            self._title_base = self.root.title()
+        try:
+            if "⏳" not in self.root.title():
+                self.root.title("⏳ " + self._title_base)
+        except Exception:
+            pass
         try:
             if indeterminate:
                 self.render_progress.configure(mode="indeterminate")
@@ -1469,9 +2004,21 @@ class EditorApp:
                 self.render_progress.configure(mode="determinate")
         except Exception:
             pass
+        self.root.after(400, self._busy_refresh)
         self.root.update_idletasks()
 
+    def _busy_refresh(self):
+        """每 400ms 刷新忙碌秒数（让用户知道任务在推进）。"""
+        if self.status_var.get().startswith("⏳"):
+            t0 = getattr(self, "_busy_t0", _time_now.time())
+            self.status_var.set(f"⏳ 任务进行中… 已等待 {int(_time_now.time() - t0)}s")
+
     def _idle(self, msg: str = "就绪"):
+        try:
+            if getattr(self, "_title_base", None):
+                self.root.title(self._title_base)
+        except Exception:
+            pass
         self.status_var.set(msg)
         try:
             self.render_progress.stop()
@@ -1592,14 +2139,19 @@ class EditorApp:
         self.root.after(2000, self._auto_refresh_media)
 
     def _delete_selected(self):
-        cid = self.timeline.selected_id
-        if not cid:
+        """删除选中片段（支持多选）。"""
+        ids = self.timeline.selected_ids()
+        if not ids:
             return
         self._push_undo()
-        if self.project.remove_clip(cid):
-            log.info("删除片段: %s", cid)
-            self.timeline.select(None, notify=True)
-            self._after_model_change()
+        removed = 0
+        for cid in ids:
+            if self.project.remove_clip(cid):
+                removed += 1
+        self._last_add = (None, 0.0)   # 清去重记录，允许删除后立即重加
+        log.info("删除片段（批量 %d）", removed)
+        self.timeline.select(None, notify=True)
+        self._after_model_change()
 
     def _split_at_playhead(self):
         cid = self.timeline.selected_id
@@ -1735,6 +2287,7 @@ class EditorApp:
             self._advance_timeline()
 
     def _preview_tick(self):
+        self._drain_ui_q()
         self.player.tick()
         self._sync_overlays()
         self.root.after(33, self._preview_tick)
@@ -1752,12 +2305,15 @@ class EditorApp:
                         spd = c.speed if c.speed > 0 else 1.0
                         local = (t_abs - c.ts) * spd
                         remain = max(c.timeline_duration() - local / spd, 0.05)
+                        meta = self.engine._probe_info(c.src)
                         specs.append({
                             "id": c.id,
                             "src": c.src,
                             "in_pt": c.in_point + local,
                             "len": remain,
                             "speed": spd,
+                            "src_w": meta.get("width", 0),
+                            "src_h": meta.get("height", 0),
                             "x_frac": float(getattr(c, "x", 0)) /
                                       max(self.project.canvas_w, 1),
                             "y_frac": float(getattr(c, "y", 0)) /
@@ -1812,31 +2368,24 @@ class EditorApp:
         local = (sec - clip.ts) * spd
         if clip.id != self._preview_clip_id:
             self._timeline_play = False
-            self._load_clip_preview(clip, autoplay=False)
+            # 换片段：加载完成后再定位（异步任务，避免 UI 冻结）
+            self._load_clip_preview(clip, autoplay=was_playing,
+                                    seek_after=local)
+            self._timeline_play = was_tl
+            return
         self.player.seek(local)
         self._timeline_play = was_tl
         if was_playing:
             self.player.play()
 
     def _audition(self):
+        """试听音频 = 在应用内从播放头播放整条时间轴（带声音）。"""
         clip = self.project.find_clip(self.timeline.selected_id or "")
-        if clip is None or isinstance(clip, ImageClip):
-            messagebox.showwarning("提示", "请先选中一个视频或音频片段。")
+        if clip is None:
+            self._play_timeline()
             return
-        ffplay = os.path.join(os.path.dirname(self.ffmpeg), "ffplay.exe")
-        if not os.path.isfile(ffplay):
-            messagebox.showerror("错误", "同目录下找不到 ffplay.exe（用于试听）。")
-            return
-        af = f"volume={clip.volume:.3f}"
-        if clip.speed != 1.0:
-            af += "," + ",".join(atempo_chain(clip.speed))
-        cmd = [ffplay, "-nodisp", "-autoexit", "-loglevel", "error",
-               "-ss", f"{clip.in_point:.3f}", "-t",
-               f"{clip.out_point - clip.in_point:.3f}",
-               "-af", af, clip.src]
-        subprocess.Popen(cmd,
-                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        log.info("试听音频: %s", clip.src)
+        self.timeline.set_playhead(clip.ts, drive_timeline=False)
+        self._play_timeline()
 
     # ================================================================ 项目文件
     def _new_project(self):
@@ -2083,21 +2632,9 @@ class EditorApp:
             return
         # 组项目：清空时间轴 → 主轨按顺序全片拼接（带转场）
         self.undo.clear()
-        proj = Project(canvas_w=data["w"], canvas_h=data["h"])
-        main = proj.track("main", create=True)
-        ts = 0.0
-        for i, f in enumerate(data["files"]):
-            span = self.engine.source_length(f)
-            if span <= 0:
-                continue
-            tr = None
-            if i < len(data["files"]) - 1 and data["tname"] and data["tdur"] > 0:
-                tr = {"name": data["tname"], "dur": min(data["tdur"], span)}
-            c = VideoClip(src=f, ts=round(ts, 3), duration=round(span, 3),
-                          in_point=0, out_point=round(span, 3), transition=tr)
-            main.add(c)
-            ts += span - (data["tdur"] if tr else 0.0)
-        if not main.clips:
+        proj = self._quick_build(data["files"], data["w"], data["h"],
+                                 data["tname"], data["tdur"])
+        if not proj.track("main").clips:
             messagebox.showerror("错误", "所选文件都无法读取时长。")
             return
         self.project = proj
@@ -2129,6 +2666,24 @@ class EditorApp:
         except Exception:
             pass
 
+    def _quick_build(self, files, w, h, tname, tdur):
+        """快速成片拼盘：按顺序全片拼接主轨并带转场（可独立测试/复用）。"""
+        proj = Project(canvas_w=w, canvas_h=h)
+        main = proj.track("main", create=True)
+        ts = 0.0
+        for i, f in enumerate(files):
+            span = self.engine.source_length(f)
+            if span <= 0:
+                continue
+            tr = None
+            if i < len(files) - 1 and tname and tdur > 0:
+                tr = {"name": tname, "dur": min(tdur, span)}
+            c = VideoClip(src=f, ts=round(ts, 3), duration=round(span, 3),
+                          in_point=0, out_point=round(span, 3), transition=tr)
+            main.add(c)
+            ts += span - (tdur if tr else 0.0)
+        return proj
+
     def _export_dialog(self):
         """导出设置：格式 + 画质 + 路径 + 保留中间产物。返回 dict 或 None。"""
         win = tk.Toplevel(self.root)
@@ -2152,7 +2707,8 @@ class EditorApp:
         ttk.Label(win, text="输出路径:").grid(row=2, column=0, sticky="e", padx=8)
         # 自动命名：项目名_分辨率_时间戳（避免重名覆盖）
         import datetime as _dt
-        out_dir = (self.dir_var.get().strip() or self.base_dir)
+        out_dir = (getattr(self, "_last_export_dir", "")
+                   or self.dir_var.get().strip() or self.base_dir)
         auto = (f"{self.project.name or '未命名'}_{self.project.canvas_w}x"
                 f"{self.project.canvas_h}_{_dt.datetime.now():%Y%m%d-%H%M}.mp4")
         path_var = tk.StringVar(value=os.path.abspath(
@@ -2162,6 +2718,13 @@ class EditorApp:
         ttk.Button(win, text="…", width=3,
                    command=lambda: self._pick_export_path(path_var, fmt_var)) \
             .grid(row=2, column=2)
+
+        def _sync_ext(*_a):
+            p = path_var.get().strip()
+            if p:
+                base, _e = os.path.splitext(p)
+                path_var.set(base + "." + fmt_var.get())
+        fmt_var.trace_add("write", _sync_ext)
         keep_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(win, text="保留中间产物（无色损轨文件，供调试/复用）",
                         variable=keep_var).grid(row=3, column=1, sticky="w")
@@ -2236,16 +2799,37 @@ class EditorApp:
         ttk.Button(row, text="在预览中播放",
                    command=lambda: self._preview_rendered(path)).pack(
             side="left", padx=4)
+        def _copy():
+            try:
+                win.clipboard_clear()
+                win.clipboard_append(path)
+                self.status_var.set("已复制成片路径")
+            except Exception:
+                pass
+        ttk.Button(row, text="复制路径", command=_copy).pack(side="left", padx=4)
         ttk.Button(row, text="关闭", command=win.destroy).pack(side="left", padx=4)
 
     def _preview_rendered(self, path: str):
-        src_len = self.engine.source_length(path)
+        """在预览中播放渲染结果（元数据后台探测，不冻结 UI）。"""
         self._timeline_play = False
+        self._start_task(
+            "打开成片预览",
+            lambda: self.engine.source_meta(path),
+            lambda meta: self._do_preview_rendered(path, meta),
+            block=True)
+
+    def _do_preview_rendered(self, path: str, meta: dict):
+        src_len = float(meta.get("duration", 0) or 0)
         self.player.load(path, 0.0, src_len or 0.1, 1.0, 960, 540,
                          audio_src=path, audio_in=0.0,
-                         audio_len=src_len or 0.1, audio_vol=1.0)
+                         audio_len=src_len or 0.1, audio_vol=1.0,
+                         src_w=int(meta.get("width", 0) or 0),
+                         src_h=int(meta.get("height", 0) or 0),
+                         fps=float(meta.get("fps", 0) or 0))
+        self._preview_clip_id = None
         self._preview_ts = 0.0
         self.player.play()
+        self._idle("成片预览中")
 
     def _poll_queue(self):
         try:
@@ -2260,6 +2844,7 @@ class EditorApp:
                     self.status_var.set(f"✅ 渲染完成: {data}")
                     self._refresh_controls()
                     log.info("渲染完成: %s", data)
+                    self._mark_exported(data)
                     self._render_done_dialog(data)
                     src_len = self.engine.source_length(data)
                     self.player.load(data, 0.0, src_len, 1.0, 960, 540,
@@ -2277,6 +2862,22 @@ class EditorApp:
         self.root.after(120, self._poll_queue)
 
     # ================================================================ 帮助
+    def _maybe_show_guide(self):
+        """首次启动显示三步引导（只一次；窗口不可见时不弹）。"""
+        if self.settings.get("guide_shown"):
+            return
+        if not getattr(self.root, "winfo_viewable", lambda: True)():
+            return
+        self.settings.set("guide_shown", True)
+        self.settings.save()
+        messagebox.showinfo(
+            "三步上手",
+            "1. 左侧选素材文件夹，双击/拖拽素材进时间轴主轨\n"
+            "2. ▶ 从头播放整条时间轴；点时间轴任意位置跳转；\n"
+            "   右键片段有 变速/跨轨/复制/分割 等菜单\n"
+            "3. 🎬 导出前点 ◧ 画布选分辨率，成品自动带预览\n\n"
+            "（你的每一步都会自动保存，随时可以继续）")
+
     def _show_help(self):
         messagebox.showinfo(
             "使用说明",
@@ -2296,7 +2897,7 @@ def main():
     _logmod.setup_logging(bundled_dir())
     root = tk.Tk()
     apply_dark_theme(root)
-    root.geometry("1200x780")
+    root.geometry("1440x820")
     root.minsize(1020, 660)
     try:
         EditorApp(root)

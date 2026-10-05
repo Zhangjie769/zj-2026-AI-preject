@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>逐鹿秋狩 · 涂色辅助</title>
+<style>
+  :root{ --bg:#1b1f27; --fg:#e5e7eb; --grass:#6d8c2f; }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"Microsoft YaHei UI","PingFang SC",sans-serif;}
+  #wrap{display:flex;flex-direction:column;height:100%;padding:8px;gap:6px;}
+  #head{font-weight:700;font-size:16px;}
+  #mode{font-size:12px;color:#fbbf24;}
+  #boardbox{flex:1 1 auto;display:flex;align-items:center;justify-content:center;min-height:0;}
+  canvas{touch-action:none;}
+  #palette{display:flex;gap:6px;flex-wrap:wrap;justify-content:center;}
+  .sw{width:46px;height:40px;border-radius:8px;border:3px solid #444;
+      display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;color:#111;
+      cursor:pointer;user-select:none;}
+  .sw.on{border-color:#fff;box-shadow:0 0 0 2px #f59e0b inset;}
+  #btns{display:flex;gap:6px;flex-wrap:wrap;justify-content:center;}
+  button{padding:9px 12px;border-radius:8px;border:0;font-size:14px;font-weight:700;
+    background:#334155;color:#e5e7eb;cursor:pointer;}
+  button.red{background:#dc2626;color:#fff;}
+  #advice{background:#fff7ed;color:#7c2d12;padding:8px 10px;border-radius:8px;
+    font-weight:700;font-size:14px;min-height:20px;}
+  #stat{font-size:12px;color:#9ca3af;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="head">逐鹿秋狩 · 涂色辅助 <span id="mode">自动提示中</span></div>
+  <div id="boardbox"><canvas id="cv"></canvas></div>
+  <div id="advice">涂色即可，程序会自动算下一步。</div>
+  <div id="stat"></div>
+  <div id="palette"></div>
+  <div id="btns">
+    <button id="undo">撤销</button>
+    <button id="clear">清空</button>
+    <button id="reset" class="red">重置 · 重新开始</button>
+  </div>
+</div>
+<script>
+"use strict";
+/* ===================== 引擎（纯前端，不需要服务器） ===================== */
+const N = 7;
+const ORDER = ["DEER5","SQ4","L3","H2","V2"];      // 0鹿 1猪 2兔 3鸭 4鸡
+const SHAPES = {
+  H2:   [[0,0],[0,1]],
+  V2:   [[0,0],[1,0]],
+  L3:   [[0,0],[1,0],[1,1]],                        // 兔：缺右上
+  SQ4:  [[0,0],[0,1],[1,0],[1,1]],
+  DEER5:[[0,1],[1,0],[1,1],[2,0],[2,1]]             // 鹿：缺左上
+};
+const SIZE = ORDER.map(n => SHAPES[n].length);
+const SHAPESET = ORDER.map(n => new Set(SHAPES[n].map(p => p[0]+","+p[1])));
+
+function buildPlacements(off){
+  const mr = Math.max(...off.map(p=>p[0])), mc = Math.max(...off.map(p=>p[1]));
+  const out = [];
+  for(let r0=0;r0<N-mr;r0++) for(let c0=0;c0<N-mc;c0++){
+    let lo=0, hi=0, cells=[];
+    for(const [dr,dc] of off){
+      const i=(r0+dr)*N+(c0+dc); cells.push(i);
+      if(i<32) lo += (1<<i); else hi += (1<<(i-32));
+    }
+    out.push({lo,hi,cells});
+  }
+  return out;
+}
+const PL = ORDER.map(n => buildPlacements(SHAPES[n]));
+
+function cellMask(cells){
+  let lo=0, hi=0;
+  for(const i of cells){ if(i<32) lo += (1<<i); else hi += (1<<(i-32)); }
+  return {lo,hi};
+}
+function codepointOf(s, mask){
+  const L=PL[s];
+  for(let k=0;k<L.length;k++) if(L[k].lo===mask.lo && L[k].hi===mask.hi) return k;
+  return -1;
+}
+
+/* 根据涂色后的 occ / empty / found，推荐下一步格子。返回 {cell, method, total} */
+function recommend(occSet, emptySet, found){
+  let occ=cellMask(occSet), emp=cellMask(emptySet);
+  let base={lo:0,hi:0};
+  const foundShapes=new Set();
+  for(const [s,cp] of found){ base.lo|=PL[s][cp].lo; base.hi|=PL[s][cp].hi; foundShapes.add(s); }
+  let rem=[]; for(let s=0;s<5;s++) if(!foundShapes.has(s)) rem.push(s);
+  rem.sort((a,b)=>SIZE[b]-SIZE[a]);                 // 大形状先放，剪枝更快
+
+  let counts=new Int32Array(49), total=0, method="exact";
+
+  if(rem.length===5 && occSet.size===0 && emptySet.size===0){
+    return {cell:40, method:"exact", total:1, prob:0.436};   // 纯空盘：预先算好的精确答案
+  }
+
+  const hasFound = rem.length < 5;
+  if(rem.length>0 && hasFound){                          // 有找到动物 -> 精确枚举(很快)
+    const CAP=4000000; let nodes=0, aborted=false; const stack=[];
+    (function rec(i, ulo, uhi){
+      nodes++;
+      if(nodes>CAP){ aborted=true; return; }
+      if(i===rem.length){
+        if((ulo&emp.lo)!==0 || (uhi&emp.hi)!==0) return;
+        if((ulo&occ.lo)!==occ.lo || (uhi&occ.hi)!==occ.hi) return;
+        total++;
+        for(const p of stack) for(const c of p) counts[c]++;
+        return;
+      }
+      const s=rem[i];
+      for(const p of PL[s]){
+        if((p.lo&ulo)!==0 || (p.hi&uhi)!==0) continue;
+        stack.push(p.cells); rec(i+1, ulo|p.lo, uhi|p.hi); stack.pop();
+        if(aborted) return;
+      }
+    })(0, base.lo, base.hi);
+    if(!aborted && total>0) { /* 精确完成 */ }
+    else method="sample";
+  } else {
+    method="sample";
+  }
+
+  if(method==="sample"){
+    counts=new Int32Array(49); total=0;
+    const K=150000, MAXATT=10000000; let att=0;
+    while(total<K && att<MAXATT){
+      att++;
+      let ulo=base.lo, uhi=base.hi, ok=true;
+      for(const s of rem){
+        const L=PL[s]; const p=L[(Math.random()*L.length)|0];
+        if((p.lo&ulo)!==0 || (p.hi&uhi)!==0){ ok=false; break; }
+        ulo|=p.lo; uhi|=p.hi;
+      }
+      if(!ok) continue;
+      if((ulo&emp.lo)!==0 || (uhi&emp.hi)!==0) continue;
+      if((ulo&occ.lo)!==occ.lo || (uhi&occ.hi)!==occ.hi) continue;
+      total++;
+      for(let c=0;c<49;c++) if(c<32 ? ((ulo>>c)&1) : ((uhi>>(c-32))&1)) counts[c]++;
+    }
+  }
+
+  if(total===0) return {cell:-1, method, total:0, inconsistent:true};
+  let bestC=-1, best=-1;
+  for(let c=0;c<49;c++){
+    if(occSet.has(c)||emptySet.has(c)) continue;
+    if(counts[c]>best){ best=counts[c]; bestC=c; }
+  }
+  return {cell:bestC, method, total, prob: best/total};
+}
+
+/* ===================== 界面 ===================== */
+const COLOR = {
+  3:["#2e8bd6","鸭"], 4:["#e8552e","鸡"], 1:["#8a5a2b","猪"],
+  0:["#d4a017","鹿"], 2:["#cfd8e3","兔"], "E":["#f0e6c0","空"]
+};
+const PALETTE = [3,4,1,0,2,"E","eraser"];
+const GRASS = "#6d8c2f";
+const MARGIN = 26;                                  // 给行列号留的位置
+
+let cells = new Array(49).fill(null);
+let history = [];
+let cur = 3;                                        // 当前颜料
+let hint = -1;
+let cell = 40;                                      // 像素
+const cv = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+const adviceEl = document.getElementById("advice");
+const statEl = document.getElementById("stat");
+const boardbox = document.getElementById("boardbox");
+
+function makePalette(){
+  const pal=document.getElementById("palette");
+  pal.innerHTML="";
+  PALETTE.forEach(k=>{
+    const d=document.createElement("div");
+    d.className="sw"+(k===cur?" on":"");
+    if(k==="eraser"){ d.style.background="#475569"; d.style.color="#fff"; d.textContent="擦"; }
+    else { d.style.background=COLOR[k][0]; d.textContent=COLOR[k][1]; }
+    d.onclick=()=>{ cur=k; makePalette(); };
+    pal.appendChild(d);
+  });
+}
+
+function sizeCanvas(){
+  const w = boardbox.clientWidth, h = boardbox.clientHeight;
+  cell = Math.max(28, Math.floor(Math.min((w-2*MARGIN-8)/N, (h-2*MARGIN-8)/N, 96)));
+  const W = cell*N + 2*MARGIN;
+  const dpr = window.devicePixelRatio||1;
+  cv.width = W*dpr; cv.height = W*dpr;
+  cv.style.width = W+"px"; cv.style.height = W+"px";
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  draw();
+}
+
+function draw(){
+  const W = cell*N + 2*MARGIN;
+  ctx.clearRect(0,0,W,W);
+  ctx.fillStyle = "#1b1f27"; ctx.fillRect(0,0,W,W);
+  ctx.font = "bold 12px monospace"; ctx.textAlign="center"; ctx.textBaseline="middle";
+  ctx.fillStyle="#d4d4d8";
+  for(let i=0;i<N;i++){
+    ctx.fillText(String(i+1), MARGIN-12, MARGIN+i*cell+cell/2);
+    ctx.fillText(String(i+1), MARGIN+i*cell+cell/2, MARGIN-13);
+  }
+  for(let r=0;r<N;r++) for(let c=0;c<N;c++){
+    const x0=MARGIN+c*cell, y0=MARGIN+r*cell, v=cells[r*N+c];
+    ctx.fillStyle = (v===null)?GRASS:COLOR[v][0];
+    ctx.fillRect(x0+1,y0+1,cell-2,cell-2);
+    ctx.lineWidth=2; ctx.strokeStyle="#e5e7eb";
+    ctx.strokeRect(x0+1,y0+1,cell-2,cell-2);
+    if(v!==null){
+      ctx.fillStyle = (v===2||v==="E"||v===0)?"#111":"#fff";
+      ctx.font = "bold "+Math.max(14,Math.floor(cell*0.38))+"px sans-serif";
+      ctx.fillText(COLOR[v][1], x0+cell/2, y0+cell/2);
+    }
+  }
+  if(hint>=0){
+    const r=Math.floor(hint/N), c=hint%N, x0=MARGIN+c*cell, y0=MARGIN+r*cell;
+    ctx.lineWidth=4; ctx.strokeStyle="#f97316";
+    ctx.strokeRect(x0+3,y0+3,cell-6,cell-6);
+    ctx.fillStyle="#f97316"; ctx.font="bold "+Math.max(16,Math.floor(cell*0.42))+"px sans-serif";
+    ctx.fillText("★", x0+cell/2, y0+cell*0.28);
+  }
+}
+
+function buildState(){
+  const occ=new Set(), emp=new Set(), found=[]; let bad=0;
+  for(let s=0;s<5;s++){
+    const cs=[];
+    for(let i=0;i<49;i++) if(cells[i]===s) cs.push(i);
+    if(cs.length===0) continue;
+    cs.forEach(i=>occ.add(i));
+    const rs=cs.map(i=>Math.floor(i/N)), csx=cs.map(i=>i%N);
+    const minr=Math.min(...rs), minc=Math.min(...csx);
+    const norm=new Set(cs.map((i,k)=> (rs[k]-minr)+","+(csx[k]-minc)));
+    let same = norm.size===SHAPESET[s].size;
+    if(same) for(const q of norm) if(!SHAPESET[s].has(q)){ same=false; break; }
+    if(same){
+      const cp=codepointOf(s, cellMask(cs));
+      if(cp>=0) found.push([s,cp]); else bad++;
+    } else bad++;
+  }
+  for(let i=0;i<49;i++) if(cells[i]==="E") emp.add(i);
+  return {occ,emp,found,bad};
+}
+
+function solve(){
+  const {occ,emp,found,bad}=buildState();
+  const res=recommend(occ,emp,found);
+  const nfound=found.length;
+  if(res.inconsistent){ hint=-1; adviceEl.textContent="⚠ 涂色自相矛盾（某只动物位置冲突），请检查"; }
+  else if(res.cell<0){ hint=-1; adviceEl.textContent=(nfound>=5?"5 只已全部找到，结束 ✅":"没有可推荐的格子"); }
+  else {
+    hint=res.cell;
+    const r=Math.floor(hint/N), c=hint%N;
+    adviceEl.textContent="👉 下一步点：第 "+(r+1)+" 行 第 "+(c+1)+" 列   （"+
+      (res.method==="exact"?"精算":"估算")+
+      (res.prob!==undefined?" "+(res.prob*100).toFixed(1)+"%":"")+"）";
+  }
+  if(bad>0) adviceEl.textContent += "   ⚠ 有动物涂得不完整，只按覆盖算";
+  statEl.textContent = "已找到动物 "+nfound+"/5   计算方法："+(res.method==="exact"?"精确枚举":"随机估算");
+  draw();
+}
+
+function paintAt(clientX, clientY){
+  const rect=cv.getBoundingClientRect();
+  const x=clientX-rect.left-MARGIN, y=clientY-rect.top-MARGIN;
+  if(x<0||y<0) return;
+  const c=Math.floor(x/cell), r=Math.floor(y/cell);
+  if(r<0||r>=N||c<0||c>=N) return;
+  const i=r*N+c, nv=(cur==="eraser")?null:cur;
+  if(cells[i]===nv) return;
+  history.push(cells.slice());
+  cells[i]=nv;
+  if(history.length>400) history.shift();
+  solve();
+}
+
+let down=false;
+cv.addEventListener("pointerdown", e=>{ down=true; cv.setPointerCapture(e.pointerId); paintAt(e.clientX,e.clientY); e.preventDefault(); });
+cv.addEventListener("pointermove", e=>{ if(down) paintAt(e.clientX,e.clientY); });
+cv.addEventListener("pointerup", ()=>{ down=false; });
+cv.addEventListener("pointercancel", ()=>{ down=false; });
+
+document.getElementById("undo").onclick=()=>{ if(history.length){ cells=history.pop(); solve(); } };
+document.getElementById("clear").onclick=()=>{ history.push(cells.slice()); cells=new Array(49).fill(null); solve(); };
+document.getElementById("reset").onclick=()=>{ history=[]; cells=new Array(49).fill(null); hint=-1; adviceEl.textContent="涂色即可，程序会自动算下一步。"; solve(); };
+
+window.addEventListener("resize", sizeCanvas);
+makePalette();
+sizeCanvas();
+solve();
+</script>
+</body>
+</html>

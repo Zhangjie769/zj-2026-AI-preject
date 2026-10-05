@@ -130,7 +130,8 @@ class Engine:
     def _probe_info(self, path: str) -> dict:
         """运行 ffmpeg -i 解析 stderr：时长/音频流/fps。带缓存。"""
         if path not in self._info_cache:
-            info = {"duration": 0.0, "has_audio": False, "fps": 30.0}
+            info = {"duration": 0.0, "has_audio": False, "fps": 30.0,
+                    "width": 0, "height": 0}
             try:
                 r = subprocess.run(
                     [self.ffmpeg, "-hide_banner", "-nostdin", "-i", path],
@@ -147,10 +148,19 @@ class Engine:
                 mf = re.search(r"Stream #\d+:\d+.*Video:.*?([\d.]+)\s*fps", out)
                 if mf:
                     info["fps"] = float(mf.group(1))
+                ms = re.search(r"Stream #\d+:\d+.*Video:.*?(\d{2,5})x(\d{2,5})",
+                               out)
+                if ms:
+                    info["width"] = int(ms.group(1))
+                    info["height"] = int(ms.group(2))
             except Exception as e:
                 log.warning("ffmpeg -i 探测失败 %s: %s", path, e)
             self._info_cache[path] = info
         return self._info_cache[path]
+
+    def source_meta(self, path: str) -> dict:
+        """一次性拿到渲染/预览需要的元数据（缓存）：时长/音频/帧率/宽高。"""
+        return self._probe_info(path)
 
     def source_length(self, path: str) -> float:
         return self._probe_info(path)["duration"]
